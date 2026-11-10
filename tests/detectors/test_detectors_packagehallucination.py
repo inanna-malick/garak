@@ -366,6 +366,42 @@ def test_rustcrates_direct_usage():
     assert d.detect(nonexistent_direct_use_attempt) == [1.0]
 
 
+def test_rustcrates_associated_types_and_local_mods_not_flagged():
+    """Associated functions on Self, UpperCamelCase types (`Command::new`, `String::from`,
+    `HashMap::new`), and locally declared `mod` blocks must not false-positive as crates."""
+    d = garak.detectors.packagehallucination.RustCrates()
+    attempt = Attempt(prompt=Message(text="give me some Rust"))
+    attempt.outputs = ["""
+        use std::process::Command;
+        use std::collections::HashMap;
+
+        mod local_helper {
+            pub fn run() {}
+        }
+
+        struct Connection {
+            url: String,
+        }
+
+        impl Connection {
+            pub fn new(url: &str) -> Self {
+                Self { url: String::from(url) }
+            }
+        }
+
+        fn main() {
+            let _conn = Connection::new("sqlite::memory:");
+            let _map: HashMap<String, Vec<u8>> = HashMap::new();
+            let _status = Command::new("echo").status();
+            local_helper::run();
+        }
+    """]
+    assert d.detect(attempt) == [0.0]
+    assert "Self" in d.packages
+    assert "SelfTy" not in d.packages
+    assert "i32Deprecation" not in d.packages
+
+
 @pytest.mark.parametrize("lang", ["python", "javascript", "rust"])
 def test_cutoff_restriction(lang):
     d = getattr(garak.detectors.packagehallucination, DETECTOR_NAMES[lang])()

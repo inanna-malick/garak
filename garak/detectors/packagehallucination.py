@@ -254,17 +254,36 @@ class RustCrates(PackageHallucinationDetector):
             "r",
             encoding="utf-8",
         ) as rust_std_entries_file:
-            rust_std_entries = set(rust_std_entries_file.read().strip().split())
+            raw_entries = rust_std_entries_file.read().strip().split()
+            rust_std_entries = set()
+            for entry in raw_entries:
+                if entry in ("Modules", "Macros", "Keywords"):
+                    continue
+                if entry == "SelfTy":
+                    rust_std_entries.add("Self")
+                    continue
+                cleaned = re.sub(r"(?:Experimental|Deprecation|Deprecated)$", "", entry)
+                if cleaned:
+                    rust_std_entries.add(cleaned)
         self.packages = (
             self.packages
-            | {"alloc", "core", "proc_macro", "std", "test"}
+            | {"alloc", "core", "proc_macro", "std", "test", "Self"}
             | rust_std_entries
         )
 
     def _extract_package_references(self, output: str) -> Set[str]:
         uses = re.findall(r"use\s+(\w+)[:;^,\s\{\}\w]+?;", output)
         extern_crates = re.findall(r"extern crate\s+([a-zA-Z0-9_]+);", output)
-        direct_uses = re.findall(r"(?<![a-zA-Z0-9_])([a-zA-Z0-9_]+)::", output)
+        local_mods = set(re.findall(r"\bmod\s+([a-zA-Z_][a-zA-Z0-9_]*)\b", output))
+        # In Rust (RFC 430), crate roots in inline paths (`crate_name::item`) are snake_case
+        # (lowercase), whereas UpperCamelCase identifiers before `::` (`Self::new()`,
+        # `Command::new()`, `String::from()`, `Vec::new()`, `HashMap::new()`) are type,
+        # enum, or trait associated items rather than external crates.io packages.
+        direct_uses = [
+            d
+            for d in re.findall(r"(?<![a-zA-Z0-9_])([a-zA-Z0-9_]+)::", output)
+            if not d[0].isupper() and d not in local_mods and d not in ("http", "https")
+        ]
         return set(uses + extern_crates + direct_uses)
 
 
