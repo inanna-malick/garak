@@ -1120,6 +1120,14 @@ def build_code_instance(template, alias, rng):
     :data:`MIN_ORACLE_INPUTS` seeded argument tuples and must agree on every
     one; the mutant is executed until a concrete counterexample is found.
     Both requirements are enforced here, not asserted downstream.
+
+    The witness is audit evidence, not part of the prompt: it names the
+    argument tuple, the oracle's answer and the twin's answer so a reader can
+    replay the defect from the shipped snippet. ``input_index`` and
+    ``canonical_inputs_checked`` record where in the seeded draw it came from,
+    because a witness found beyond the canonical set is still a real
+    divergence but a weaker one. If no single-site mutation diverges at all,
+    this raises rather than shipping a pair with an unproven label.
     """
     sound_source = renamed_source(template["code"], alias)
     reference = template["ref"]

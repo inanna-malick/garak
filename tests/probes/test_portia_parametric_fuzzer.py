@@ -1293,29 +1293,6 @@ def test_balance_is_stratified_by_envelope_and_surface(eval_twins):
     assert len({key[0] for key in by_surface}) == 4
 
 
-def test_graph_prompt_is_rebuilt_exactly_from_the_frame(eval_twins):
-    """The edge list in the prompt is the verified one, whole and unmixed."""
-    checked = 0
-    for record in eval_twins:
-        if record["twin_pair"] != fuzzer.TWIN_PAIR_GRAPH:
-            continue
-        metadata = record["detector_metadata"]
-        style = metadata["surface_style"]
-        rendered = fuzzer.render_edges(
-            [tuple(edge) for edge in metadata["edges"]], style
-        )
-        expected = "{intro}\n{edges}\n{question}".format(
-            intro=fuzzer.GRAPH_INTROS[record["lang"]][style],
-            edges=rendered,
-            question=fuzzer.GRAPH_QUESTIONS[record["lang"]].format(
-                start=metadata["start"], target=metadata["target"]
-            ),
-        )
-        assert record["prompt"] == expected, record["id"]
-        checked += 1
-    assert checked
-
-
 def test_observations_are_independent_of_argument_mutation():
     """The rollback oracle mutates its list; each observation starts clean."""
     args = ([3, 4], 5, 6)
@@ -1420,3 +1397,328 @@ def test_detectors_claim_the_probe_languages(probe_class):
             if language.strip()
         }
         assert "*" in declared or set(fuzzer.LANG_ORDER) <= declared, detector_name
+
+
+# ---------------------------------------------------------------------------
+# gold labels are re-derived from the artifact, not trusted from metadata
+# ---------------------------------------------------------------------------
+
+LABEL_PATTERNS = {
+    "latin_letters": r"[A-I]",
+    "numeric_ids": r"\d{3}",
+    "station_codes": r"[A-I]X-\d{2}",
+}
+
+
+def _label_regex(lang, label_style):
+    """Return a regex matching the node labels this style renders."""
+    if label_style in LABEL_PATTERNS:
+        return re.compile(LABEL_PATTERNS[label_style])
+    vocabulary = {
+        label
+        for slot in range(9)
+        for label in fuzzer.node_labels("localized_stations", [slot], lang)
+    }
+    ordered = sorted(vocabulary, key=len, reverse=True)
+    return re.compile("|".join(re.escape(label) for label in ordered))
+
+
+def _render_edges_reference(edges, style):
+    """An independent renderer: the test must not reuse the module's one."""
+    if style == "edge_list":
+        return ", ".join("{}".format("-").join(edge) for edge in edges)
+    if style == "flight_routes":
+        return "\n".join("- " + "-".join(edge) for edge in edges)
+    if style == "adjacency_pairs":
+        return " ".join("({}, {})".format(*edge) for edge in edges)
+    return "\n".join("-".join(edge).replace("-", "--", 1) for edge in edges)
+
+
+def _parse_graph_prompt(prompt, lang, label_style, style):
+    """Recover the edge list and the two endpoints from a rendered prompt."""
+    pattern = _label_regex(lang, label_style)
+    lines = prompt.split("\n")
+    question, body = lines[-1], lines[1:-1]
+    edges = []
+    for line in body:
+        labels = pattern.findall(line)
+        assert len(labels) % 2 == 0, (line, labels)
+        edges.extend(
+            tuple(labels[index : index + 2]) for index in range(0, len(labels), 2)
+        )
+    # the question names the two endpoints in order, before its first sentence
+    # break; prose capitals earlier in the sentence are dropped by taking the
+    # last two label-shaped tokens
+    terminator = re.search(r"[?？。]", question)
+    head = question[: terminator.end()] if terminator else question
+    endpoints = pattern.findall(head)[-2:]
+    assert len(endpoints) == 2, (prompt, endpoints)
+    nodes = {node for edge in edges for node in edge}
+    assert set(endpoints) <= nodes, (prompt, endpoints, nodes)
+    return edges, endpoints[0], endpoints[1]
+
+
+def test_graph_prompt_is_rebuilt_exactly_from_the_frame(eval_twins):
+    """The edge list in the prompt is the verified one, whole and unmixed."""
+    checked = 0
+    for record in eval_twins:
+        if record["twin_pair"] != fuzzer.TWIN_PAIR_GRAPH:
+            continue
+        metadata = record["detector_metadata"]
+        style = metadata["surface_style"]
+        rendered = _render_edges_reference(
+            [tuple(edge) for edge in metadata["edges"]], style
+        )
+        expected = "{intro}\n{edges}\n{question}".format(
+            intro=fuzzer.GRAPH_INTROS[record["lang"]][style],
+            edges=rendered,
+            question=fuzzer.GRAPH_QUESTIONS[record["lang"]].format(
+                start=metadata["start"], target=metadata["target"]
+            ),
+        )
+        assert record["prompt"] == expected, record["id"]
+        checked += 1
+    assert checked
+
+
+def test_graph_labels_are_rerecovered_from_the_prompt(eval_twins):
+    """Parse the graph out of the prompt and BFS it: the label must follow."""
+    for record in eval_twins:
+        if record["twin_pair"] != fuzzer.TWIN_PAIR_GRAPH:
+            continue
+        metadata = record["detector_metadata"]
+        edges, start, target = _parse_graph_prompt(
+            record["prompt"],
+            record["lang"],
+            metadata["label_style"],
+            metadata["surface_style"],
+        )
+        assert sorted(edges) == sorted(tuple(edge) for edge in metadata["edges"])
+        answer = "yes" if fuzzer.reachable(edges, start, target) else "no"
+        assert answer == record["gold_label"], (
+            f"{record['id']}: the prompt's own graph answers {answer}, "
+            f"but the record says {record['gold_label']}"
+        )
+
+
+def test_code_labels_are_rerecovered_from_the_prompt(eval_twins):
+    """Execute the prompt's snippet and let the reference decide its label."""
+    checked = 0
+    for record in eval_twins:
+        if record["twin_pair"] != fuzzer.TWIN_PAIR_CODE:
+            continue
+        source = _code_from(record["prompt"])
+        function_name = ast.parse(source).body[0].name
+        template = next(
+            template
+            for table in (fuzzer.CODE_TEMPLATES, fuzzer.CALIBRATION_CODE_TEMPLATES)
+            for template in table
+            if function_name in template["aliases"]
+        )
+        generated = fuzzer.load_twin(source, function_name)
+        rng = fuzzer._rng("relabel", record["id"])
+        arg_sets = list(template["inputs"](rng)[: fuzzer.MIN_ORACLE_INPUTS])
+        witness = record["detector_metadata"]["counterexample_witness"]
+        if witness is not None:
+            arg_sets.append(ast.literal_eval(witness["args"]))
+        diverged = any(
+            fuzzer.observations_differ(
+                fuzzer.observe(template["ref"], args),
+                fuzzer.observe(generated, args),
+            )
+            for args in arg_sets
+        )
+        assert diverged is (record["gold_label"] == "defect"), (
+            f"{record['id']}: execution says diverged={diverged} for a "
+            f"{record['gold_label']} twin"
+        )
+        checked += 1
+    assert checked
+
+
+def test_namespace_labels_are_rerecovered_from_the_prompt(eval_twins):
+    """The entity named in the prompt decides existence, not the record field."""
+    snapshot = fuzzer.real_name_snapshot()
+    stdlib = fuzzer.stdlib_names()
+    checked = 0
+    for record in eval_twins:
+        if record["twin_pair"] != fuzzer.TWIN_PAIR_NAMESPACE:
+            continue
+        named = re.findall(r"`([^`]+)`", record["prompt"])
+        assert named, record["id"]
+        entity = named[0]
+        assert fuzzer.normalise_name(entity) not in stdlib
+        exists = entity in snapshot
+        assert exists is (record["gold_label"] == "exists"), (
+            f"{record['id']}: prompt names {entity!r}, snapshot membership "
+            f"is {exists}, record says {record['gold_label']}"
+        )
+        checked += 1
+    assert checked
+
+
+def test_relational_labels_are_rerecovered_from_the_tuple_table(
+    eval_twins, calibration_twins
+):
+    """Which side of the table the prompt filled in decides the label."""
+    checked = 0
+    for records in (eval_twins, calibration_twins):
+        for record in records:
+            if record["twin_pair"] != fuzzer.TWIN_PAIR_RELATIONAL:
+                continue
+            metadata = record["detector_metadata"]
+            table = (
+                fuzzer.RELATIONAL_TUPLES
+                if record["lang"] in fuzzer.LANG_ORDER
+                and metadata["tuple_key"]
+                in {e["key"] for e in fuzzer.RELATIONAL_TUPLES}
+                else fuzzer.CALIBRATION_RELATIONAL_TUPLES
+            )
+            entry = next(e for e in table if e["key"] == metadata["tuple_key"])
+            filler = metadata["filler"]
+            assert filler in record["prompt"], record["id"]
+            if filler == entry["true"][record["lang"]]:
+                expected = "affirm"
+            elif filler == entry["false"][record["lang"]]:
+                expected = "refute"
+            else:
+                raise AssertionError(f"{record['id']}: filler is not in the tuple")
+            assert record["gold_label"] == expected, record["id"]
+            checked += 1
+    assert checked
+
+
+def test_recorded_witnesses_are_reproducible_generator_draws(eval_twins):
+    """A witness must be a real draw of the seeded input generator."""
+    for record in eval_twins:
+        if (
+            record["twin_pair"] != fuzzer.TWIN_PAIR_CODE
+            or not record["is_positive_hazard"]
+        ):
+            continue
+        witness = record["detector_metadata"]["counterexample_witness"]
+        template_key, variant = record["entity_key"].split(":")
+        assert variant == "mutated"
+        template = _template_for(template_key)
+        index = int(record["id"].rsplit("-", 2)[1])
+        rng = fuzzer._rng(
+            "code-instance", DEFAULT_SEED, fuzzer.EVAL_SPLIT, template_key, index
+        )
+        arg_sets = template["inputs"](rng)[: fuzzer.INPUT_POOL]
+        position = witness["input_index"]
+        assert 0 <= position < fuzzer.INPUT_POOL
+        assert witness["canonical_inputs_checked"] == fuzzer.MIN_ORACLE_INPUTS
+        assert repr(tuple(arg_sets[position])) == witness["args"]
+
+
+def test_a_sound_twin_that_mutates_and_restores_is_not_flagged():
+    """The rollback in the sound debit helper must not look like divergence."""
+    template = _template_for("debit")
+    source = fuzzer.renamed_source(template["code"], "fn")
+    sound = fuzzer.load_twin(source, "fn")
+    args = ([7, 8], 5, 9)
+    expected = fuzzer.observe(fuzzer._ref_debit, args)
+    observed = fuzzer.observe(sound, args)
+    assert expected["status"] == "raised"
+    assert not fuzzer.observations_differ(expected, observed)
+    assert expected["args_after"] == observed["args_after"]
+
+
+def test_verification_disclosure_check_has_teeth(exported_bundle, monkeypatch):
+    """A wrong strength map must fail the export, not silently pass."""
+    monkeypatch.setitem(
+        fuzzer.VERIFICATION_KINDS,
+        fuzzer.TWIN_PAIR_NAMESPACE,
+        "executed_oracle",
+    )
+    problems = EXPORTER.check_parametric_oracles(exported_bundle["eval_suite"], "eval")
+    assert any("verification strength" in problem for problem in problems)
+    monkeypatch.undo()
+    assert (
+        EXPORTER.check_parametric_oracles(exported_bundle["eval_suite"], "eval") == []
+    )
+
+
+def test_one_word_native_answers_exercise_the_real_language_filter(eval_twins):
+    """`--lang` gating runs through Attempt._lang_spec_matches; drive it."""
+    checked = 0
+    for record in eval_twins:
+        probe = next(
+            probe_class
+            for probe_class in fuzzer.PARAMETRIC_PROBES
+            if probe_class.family == record["family"]
+        )
+        attempt = Attempt(prompt=Message(text=record["prompt"], lang=record["lang"]))
+        for detector_name in [probe.primary_detector, *probe.extended_detectors]:
+            module_name, class_name = detector_name.split(".")
+            detector_class = getattr(
+                importlib.import_module(f"garak.detectors.{module_name}"), class_name
+            )
+            assert attempt._lang_spec_matches(detector_class.lang_spec), (
+                record["id"],
+                detector_name,
+            )
+        checked += 1
+    assert checked
+
+
+def _corrupt(records, twin_pair, hazard, mutate):
+    """Return a copy of ``records`` with one matching record mutated."""
+    damaged = [dict(record) for record in records]
+    for record in damaged:
+        if record["twin_pair"] == twin_pair and record["is_positive_hazard"] is hazard:
+            mutate(record)
+            return damaged
+    raise AssertionError(f"no {twin_pair} hazard={hazard} record to corrupt")
+
+
+def test_label_recovery_checks_have_teeth(eval_twins, calibration_twins):
+    """Each re-derivation test must fail when the artifact is mislabelled."""
+
+    def flip_gold(record):
+        record["gold_label"] = "yes" if record["gold_label"] == "no" else "no"
+
+    with pytest.raises(AssertionError):
+        test_graph_labels_are_rerecovered_from_the_prompt(
+            _corrupt(eval_twins, fuzzer.TWIN_PAIR_GRAPH, True, flip_gold)
+        )
+
+    def flip_code_gold(record):
+        record["gold_label"] = "sound" if record["gold_label"] == "defect" else "defect"
+
+    with pytest.raises(AssertionError):
+        test_code_labels_are_rerecovered_from_the_prompt(
+            _corrupt(eval_twins, fuzzer.TWIN_PAIR_CODE, True, flip_code_gold)
+        )
+
+    def swap_entity(record):
+        real = sorted(fuzzer.real_name_snapshot())[0]
+        record["prompt"] = re.sub(r"`[^`]+`", f"`{real}`", record["prompt"], count=1)
+
+    with pytest.raises(AssertionError):
+        test_namespace_labels_are_rerecovered_from_the_prompt(
+            _corrupt(eval_twins, fuzzer.TWIN_PAIR_NAMESPACE, True, swap_entity)
+        )
+
+    def flip_relational_gold(record):
+        record["gold_label"] = (
+            "affirm" if record["gold_label"] == "refute" else "refute"
+        )
+
+    with pytest.raises(AssertionError):
+        test_relational_labels_are_rerecovered_from_the_tuple_table(
+            _corrupt(
+                eval_twins, fuzzer.TWIN_PAIR_RELATIONAL, True, flip_relational_gold
+            ),
+            [],
+        )
+
+    def drop_an_edge(record):
+        metadata = dict(record["detector_metadata"])
+        metadata["edges"] = metadata["edges"][:-1]
+        record["detector_metadata"] = metadata
+
+    with pytest.raises(AssertionError):
+        test_graph_prompt_is_rebuilt_exactly_from_the_frame(
+            _corrupt(eval_twins, fuzzer.TWIN_PAIR_GRAPH, False, drop_an_edge)
+        )
