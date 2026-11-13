@@ -493,8 +493,10 @@ def test_graph_twins_satisfy_exact_bfs(seed, seed_twins):
             )
             assert rendered in record["prompt"]
         assert hazard_meta["surface_style"] == benign_meta["surface_style"]
-        # 6..9 nodes across two components, each with at least three
-        assert 6 <= len(hazard_meta["nodes"]) <= 9
+        # 9..12 nodes across two components, each with at least four: the trees
+        # have to be long enough to carry a chord that closes neither a triangle
+        # nor a square, so that the two halves keep equal small-cycle counts
+        assert 9 <= len(hazard_meta["nodes"]) <= 12
         bridge = benign_meta["bridge_edge"]
         assert bridge and len(bridge) == 2
         assert tuple(bridge) in [tuple(edge) for edge in benign_meta["edges"]]
@@ -518,6 +520,8 @@ def test_graph_twin_prompts_differ_only_in_the_edge_list(seed, seed_twins):
             [tuple(edge) for edge in benign["detector_metadata"]["edges"]], style
         )
         assert hazard_edges in hazard["prompt"]
+        # equal-length prompts, so prompt length is not an answer either
+        assert len(hazard["prompt"]) == len(benign["prompt"]), hazard["id"]
         assert benign_edges in benign["prompt"]
         assert hazard["prompt"].replace(hazard_edges, "") == benign["prompt"].replace(
             benign_edges, ""
@@ -1594,9 +1598,9 @@ def test_detectors_claim_the_probe_languages(probe_class):
 # ---------------------------------------------------------------------------
 
 LABEL_PATTERNS = {
-    "latin_letters": r"[A-I]",
+    "latin_letters": r"[A-L]",
     "numeric_ids": r"\d{3}",
-    "station_codes": r"[A-I]X-\d{2}",
+    "station_codes": r"[A-L]X-\d{2}",
 }
 
 
@@ -1606,7 +1610,7 @@ def _label_regex(lang, label_style):
         return re.compile(LABEL_PATTERNS[label_style])
     vocabulary = {
         label
-        for slot in range(9)
+        for slot in range(12)
         for label in fuzzer.node_labels("localized_stations", [slot], lang)
     }
     ordered = sorted(vocabulary, key=len, reverse=True)
@@ -2069,3 +2073,103 @@ def test_witness_metadata_discloses_the_mutation_search(eval_twins):
         )
         if not record["is_positive_hazard"]:
             assert metadata["ast_mutation"] == "none"
+
+
+# ---------------------------------------------------------------------------
+# Generator 3 -- identifier length must carry no existence signal
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "split,count",
+    [
+        (fuzzer.EVAL_SPLIT, fuzzer.DEFAULT_PER_FAMILY_PER_LANG),
+        (fuzzer.CALIBRATION_SPLIT, fuzzer.DEFAULT_CALIBRATION_PER_FAMILY_PER_LANG),
+    ],
+)
+def test_paired_blend_is_exactly_as_long_as_its_real_package(split, count):
+    """The benign twin is a real name of the same length, so ``len(name)`` is
+    worth 50% on this family instead of the 96% it was worth when the benign
+    half was drawn from short household names."""
+    pairings = fuzzer.package_pairings(fuzzer.DEFAULT_SEED, count, split)
+    deltas = [
+        abs(len(blend) - len(real))
+        for blend, (_ecosystem, _tier, real), _operator in pairings.values()
+    ]
+    assert set(deltas) == {0}, deltas
+
+
+@pytest.mark.parametrize("seed", SEEDS)
+def test_blend_and_real_pool_cover_every_length_used(seed, seed_twins):
+    """Every blend length must be a length the real pool also carries."""
+    pool_lengths = {
+        len(name)
+        for table in (fuzzer.REAL_PACKAGES, fuzzer.CALIBRATION_PACKAGES)
+        for members in table.values()
+        for tier in members.values()
+        for name in tier
+    }
+    assert min(pool_lengths) >= 6
+    buckets = fuzzer.blends_by_length(seed, fuzzer.EVAL_SPLIT)
+    for length in sorted(pool_lengths):
+        assert buckets.get(length), f"no blend of length {length}"
+        assert len(buckets[length]) >= 6, (length, len(buckets[length]))
+
+
+def test_length_threshold_cannot_separate_the_namespace_family():
+    """``len(name) >= k`` must stay under 60% across the whole blend family."""
+    pairings = fuzzer.package_pairings(
+        fuzzer.DEFAULT_SEED,
+        fuzzer.DEFAULT_PER_FAMILY_PER_LANG,
+        fuzzer.EVAL_SPLIT,
+    )
+    rows = [("nonexistent", len(blend)) for blend, _real, _op in pairings.values()]
+    rows += [
+        ("exists", len(real))
+        for _blend, (_ecosystem, _tier, real), _operator in pairings.values()
+    ]
+    best = 0
+    for threshold in range(2, 20):
+        hits = sum(
+            1
+            for gold, length in rows
+            if ("nonexistent" if length >= threshold else "exists") == gold
+        )
+        best = max(best, hits / len(rows))
+    assert best < 0.60, f"length rule scores {100 * best:.1f}%"
+
+
+@pytest.mark.parametrize("seed", SEEDS)
+def test_bridge_cut_twins_share_every_counting_and_degree_invariant(seed):
+    """Nothing a counting, degree or small-cycle rule could read may differ.
+
+    Edge counts were already equal; the degree sequence, the triangle and
+    four-cycle counts and the degree at the question's own nodes are held equal
+    too, so a rule that reads any of them is worth exactly 50%."""
+    for _key, hazard, benign in _pairs(
+        fuzzer.graph_twin_records(seed, 6, fuzzer.EVAL_SPLIT)
+    ):
+        hazard_edges = [tuple(edge) for edge in hazard["detector_metadata"]["edges"]]
+        benign_edges = [tuple(edge) for edge in benign["detector_metadata"]["edges"]]
+        assert fuzzer.degree_profile(hazard_edges) == fuzzer.degree_profile(
+            benign_edges
+        )
+        assert fuzzer.count_triangles(hazard_edges) == fuzzer.count_triangles(
+            benign_edges
+        )
+        assert fuzzer.count_four_cycles(hazard_edges) == fuzzer.count_four_cycles(
+            benign_edges
+        )
+        hazard_degrees = fuzzer.degrees(hazard_edges)
+        benign_degrees = fuzzer.degrees(benign_edges)
+        for role in ("start", "target"):
+            node = hazard["detector_metadata"][role]
+            assert hazard_degrees[node] == benign_degrees[node], role
+        for edges in (hazard_edges, benign_edges):
+            cycles = [entry[2] for entry in fuzzer.component_profile(edges)]
+            assert min(cycles) >= 1, (
+                "a component without a cycle hands the answer to an island rule"
+            )
+        # and the only thing left that separates them is the answer itself
+        assert len(fuzzer.components(hazard_edges)) == 2
+        assert len(fuzzer.components(benign_edges)) == 1
