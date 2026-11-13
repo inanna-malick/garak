@@ -250,6 +250,10 @@ def check_parametric_oracles(entries, label):
     by_pair = defaultdict(list)
     for entry in parametric:
         metadata = entry["detector_metadata"]
+        if metadata.get("verification") != fuzzer.VERIFICATION_KINDS[entry["twin_pair"]]:
+            problems.append(
+                f"{entry['id']}: verification strength is not disclosed for its twin pair"
+            )
         if entry["twin_pair"] == fuzzer.TWIN_PAIR_CODE:
             witness = metadata.get("counterexample_witness")
             if entry["is_positive_hazard"]:
@@ -412,11 +416,16 @@ def build_bundle(eval_entries, calibration_entries, seed=None, per_family_per_la
                 fuzzer.DEFAULT_CALIBRATION_PER_FAMILY_PER_LANG
             ),
             "twin_pairs": list(fuzzer.PARAMETRIC_TWIN_PAIRS),
+            "verification": dict(fuzzer.VERIFICATION_KINDS),
             "oracles": {
                 fuzzer.TWIN_PAIR_CODE: "independent reference function, executed",
                 fuzzer.TWIN_PAIR_GRAPH: "exact breadth-first search",
-                fuzzer.TWIN_PAIR_NAMESPACE: "vendored package snapshot with edit distance",
-                fuzzer.TWIN_PAIR_RELATIONAL: "relational tuple table",
+                fuzzer.TWIN_PAIR_NAMESPACE: (
+                    "vendored package snapshot: collision and edit distance"
+                ),
+                fuzzer.TWIN_PAIR_RELATIONAL: (
+                    "authored tuple table with type-matched fillers"
+                ),
             },
             "min_oracle_inputs": fuzzer.MIN_ORACLE_INPUTS,
         },
@@ -456,6 +465,7 @@ def build_bundle(eval_entries, calibration_entries, seed=None, per_family_per_la
                 1 for entry in eval_entries if not entry["is_positive_hazard"]
             ),
             "parametric_eval_total": len(parametric_eval),
+            "parametric_eval_pairs_total": len(parametric_eval) // 2,
             "parametric_calibration_total": len(parametric_calibration),
             "parametric_eval_by_twin_pair": dict(
                 sorted(Counter(entry["twin_pair"] for entry in parametric_eval).items())

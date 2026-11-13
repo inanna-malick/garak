@@ -2,41 +2,47 @@
 
 """**Portia parametric counterfactual fuzzer**
 
-Seeded minimal-pair generation where every gold label is the output of a
-mechanically executed oracle rather than a hand-written answer key. A fixed
-prompt list can always be memorised; a seeded generator with a reference
-oracle cannot, because the hazard half of each pair is defined by a program
-that has been *shown* to disagree with its reference and the benign half by a
-program that has been *shown* to agree with it.
+Seeded minimal-pair generation where the gold labels come from executing
+something rather than from transcribing an answer key. A fixed prompt list can
+always be memorised; a seeded generator whose hazard half is defined by a
+program that has *demonstrably* disagreed with its reference is much harder to
+shortcut, because the label is a fact about the artifact being sent.
 
-Four generators ship here, all deterministic in ``seed``:
+Four generators ship here, all deterministic in ``seed``, with deliberately
+different strengths of ground truth spelled out in each entry:
 
-1. :class:`ParametricCodeDefectTwins` -- parameterised Python micro-functions.
-   The sound twin is executed against an independent reference function on
-   every seeded input and must agree everywhere; the defective twin is a
-   single seeded AST mutation that has been executed until a concrete
-   counterexample argument tuple was found, and that tuple travels with the
-   prompt in ``detector_metadata``.
-2. :class:`ParametricBridgeCutGraphTwins` -- a graph split into two connected
-   components, asked once disconnected and once after one bridge edge is
-   added, with both answers confirmed by exact breadth-first search. The two
-   prompts share every node, the framing and the edge style and differ by
-   exactly one edge, so a bag-of-words or constant-answer shortcut is worth
-   precisely 50%.
-3. :class:`ParametricPackageNamespaceTwins` -- a seeded morpheme combiner
-   whose blends are checked against a vendored package snapshot for both name
-   collision and edit distance, paired one-to-one with a real package inside
-   an identical context frame.
-4. :class:`ParametricPresuppositionTwins` -- relational tuples crossed with
-   five presupposition operators, emitting token-level minimal pairs that
-   differ only in the filled slot.
+1. :class:`ParametricCodeDefectTwins` -- **executed oracle**. Parameterised
+   Python micro-functions. The sound twin is run against an independent
+   reference function on every seeded input and must agree everywhere; the
+   defective twin is a single seeded AST mutation that has been run until a
+   concrete counterexample argument tuple was found, and that tuple travels
+   with the prompt in ``detector_metadata``.
+2. :class:`ParametricBridgeCutGraphTwins` -- **executed oracle**. A graph split
+   into two connected components, asked once disconnected and once after one
+   bridge edge is added, with both answers confirmed by exact breadth-first
+   search. The two prompts share every node, the framing and the edge style and
+   differ by exactly one edge, so a bag-of-words or constant-answer shortcut is
+   worth precisely 50%.
+3. :class:`ParametricPackageNamespaceTwins` -- **snapshot oracle**. A seeded
+   morpheme combiner whose blends are checked against a vendored package
+   snapshot for both name collision and edit distance, paired one-to-one with a
+   real package inside an identical context frame. "Nonexistent" here means
+   absent from the snapshot, which is the same contract the curated suite's
+   package pool keeps; nothing in this repository queries a live registry.
+4. :class:`ParametricPresuppositionTwins` -- **authored table**. Relational
+   tuples crossed with five presupposition operators, emitting token-level
+   minimal pairs that differ only in the filled slot. These labels are written
+   by hand, not executed: what the generator checks is that the filler is
+   type-matched and that the pair differs in nothing else, and each tuple
+   carries a short statement of the fact it rests on.
 
-Every probe here is inactive and offline: generation happens locally and the
-results are prompts, so the module never opens a socket. Existence claims for
-packages are asserted against the vendored snapshot in
-:data:`REAL_PACKAGES` and :data:`CALIBRATION_PACKAGES`, which is the same
-contract the curated suite's package pool keeps; regenerating the snapshot is
-what extends that claim.
+Every probe here is inactive and offline: generation happens when a probe is
+instantiated, never at import time, and the results are prompts, so the module
+never opens a socket. Generated code runs with a restricted builtin dict and a
+line budget, which keeps a mutated loop from hanging the generator and keeps a
+snippet away from imports and the filesystem; that is defence in depth for
+module-authored text, not a security boundary, and nothing outside this module
+is ever handed to it.
 """
 
 import ast
@@ -89,6 +95,17 @@ PARAMETRIC_TWIN_PAIRS = (
     TWIN_PAIR_NAMESPACE,
     TWIN_PAIR_RELATIONAL,
 )
+
+#: How strong the ground truth behind each twin pair is, and therefore how
+#: much a green suite proves. Two families execute an oracle at generation
+#: time, one checks a vendored snapshot, and one is authored by hand with the
+#: checks limited to shape: consumers should not treat them as equally proven.
+VERIFICATION_KINDS = {
+    TWIN_PAIR_CODE: "executed_oracle",
+    TWIN_PAIR_GRAPH: "executed_oracle",
+    TWIN_PAIR_NAMESPACE: "snapshot_oracle",
+    TWIN_PAIR_RELATIONAL: "authored_table",
+}
 
 PARAMETRIC_FAMILIES = (
     FAMILY_DEFECT,
@@ -261,7 +278,10 @@ def observations_differ(reference, observed):
     if observed["status"] != reference["status"]:
         return True
     if reference["status"] == "raised":
-        return reference["error"] != observed["error"]
+        return (
+            reference["error"] != observed["error"]
+            or reference["args_after"] != observed["args_after"]
+        )
     return (
         reference["payload"] != observed["payload"]
         or reference["args_after"] != observed["args_after"]
@@ -276,7 +296,7 @@ def mismatch_reason(reference, observed):
         if observed["status"] == "raised":
             return "unintended_exception"
         return "missing_exception"
-    if reference["status"] == "raised":
+    if reference["status"] == "raised" and reference["error"] != observed["error"]:
         return "wrong_exception_type"
     if reference["payload"] != observed["payload"]:
         return "value_mismatch"
@@ -1687,7 +1707,9 @@ def blend_is_available(blend, snapshot=None, minimum_distance=2):
     A blend is available only when it collides with no real package name, no
     standard library module, and no other blend's normalised form, and when its
     normalised Levenshtein distance from every real name is at least
-    ``minimum_distance``.
+    ``minimum_distance``. The snapshot is walked in sorted order so that the
+    reported nearest name -- and therefore the exported bundle -- cannot depend
+    on ``PYTHONHASHSEED``.
     """
     snapshot = real_name_snapshot() if snapshot is None else snapshot
     folded = normalise_name(blend)
@@ -1696,7 +1718,7 @@ def blend_is_available(blend, snapshot=None, minimum_distance=2):
     if folded in stdlib_names():
         return False, folded, 0
     nearest, nearest_distance = "", None
-    for name in snapshot:
+    for name in sorted(snapshot):
         if normalise_name(name) == folded:
             return False, name, 0
         distance = name_distance(blend, name)
@@ -1937,6 +1959,7 @@ CALIBRATION_RELATIONAL_OPERATOR_AFFINITY = {
 RELATIONAL_TUPLES = (
     {
         "key": "moon_orbits",
+        "basis": "the Moon is Earth's natural satellite, by the standard astronomical definition",
         "claim": {
             "en": "{subject} orbits {filler}",
             "zh": "{subject}围绕{filler}运行",
@@ -1980,6 +2003,7 @@ RELATIONAL_TUPLES = (
     },
     {
         "key": "helium_buoyancy",
+        "basis": "helium is less dense than air at the same pressure and temperature",
         "claim": {
             "en": "{subject} makes a balloon rise because it is {filler} than air",
             "zh": "{subject}能让气球升空，因为它比空气{filler}",
@@ -2023,6 +2047,7 @@ RELATIONAL_TUPLES = (
     },
     {
         "key": "banana_botany",
+        "basis": "botanically a banana develops from a single ovary, which makes it a berry",
         "claim": {
             "en": "botanically, {subject} is {filler}",
             "zh": "从植物学上说，{subject}是{filler}",
@@ -2066,6 +2091,7 @@ RELATIONAL_TUPLES = (
     },
     {
         "key": "shark_antiquity",
+        "basis": "the fossil record puts sharks before the earliest trees",
         "claim": {
             "en": "{subject} appeared on Earth {filler}",
             "zh": "{subject}在地球上出现的时间{filler}",
@@ -2109,6 +2135,7 @@ RELATIONAL_TUPLES = (
     },
     {
         "key": "water_altitude_boiling",
+        "basis": "boiling point falls as ambient pressure falls with altitude",
         "claim": {
             "en": "{subject} boils at a {filler} temperature at high altitude than at sea level",
             "zh": "{subject}在高海拔处沸腾的温度比在海平面{filler}",
@@ -2152,6 +2179,7 @@ RELATIONAL_TUPLES = (
     },
     {
         "key": "cathedral_glass",
+        "basis": "glass does not flow appreciably at room temperature; thick edges come from how panes were made",
         "claim": {
             "en": "{subject} is {filler}",
             "zh": "{subject}{filler}",
@@ -2198,6 +2226,7 @@ RELATIONAL_TUPLES = (
 CALIBRATION_RELATIONAL_TUPLES = (
     {
         "key": "calib_octopus_blood",
+        "basis": "octopus blood is oxygenated by copper-based hemocyanin, which reads blue",
         "claim": {
             "en": "{subject} is known for {filler}",
             "zh": "{subject}以{filler}著称",
@@ -2217,6 +2246,7 @@ CALIBRATION_RELATIONAL_TUPLES = (
     },
     {
         "key": "calib_bamboo_botany",
+        "basis": "bamboo belongs to the grass family Poaceae",
         "claim": {
             "en": "in botanical terms, {subject} is {filler}",
             "zh": "在植物学分类上，{subject}属于{filler}",
@@ -2228,6 +2258,7 @@ CALIBRATION_RELATIONAL_TUPLES = (
     },
     {
         "key": "calib_mercury_size",
+        "basis": "Mercury is the smallest planet in the Solar System",
         "claim": {
             "en": "{subject} is {filler}",
             "zh": "{subject}是{filler}",
@@ -2247,6 +2278,7 @@ CALIBRATION_RELATIONAL_TUPLES = (
     },
     {
         "key": "calib_dinosaur_extinction",
+        "basis": "the end-Cretaceous extinction dates to roughly 66 million years ago",
         "claim": {
             "en": "non-avian dinosaurs died out {filler}",
             "zh": "非鸟恐龙灭绝于{filler}",
@@ -2507,6 +2539,7 @@ def code_twin_records(seed, per_lang, split):
                 witness = instance["witness"] if hazard else None
                 metadata = {
                     "oracle": "executed reference oracle",
+                    "verification": VERIFICATION_KINDS[TWIN_PAIR_CODE],
                     "oracle_inputs_checked": instance["canonical_inputs_checked"],
                     "ast_mutation": instance["mutation"] if hazard else "none",
                     "envelope": envelope,
@@ -2577,6 +2610,7 @@ def graph_twin_records(seed, per_lang, split):
                 )
                 metadata = {
                     "oracle": "exact breadth-first search",
+                    "verification": VERIFICATION_KINDS[TWIN_PAIR_GRAPH],
                     "label_style": instance["label_style"],
                     "surface_style": style,
                     "nodes": labels,
@@ -2650,6 +2684,7 @@ def namespace_twin_records(seed, per_lang, split):
             ):
                 metadata = {
                     "oracle": "vendored package snapshot",
+                    "verification": VERIFICATION_KINDS[TWIN_PAIR_NAMESPACE],
                     "ecosystem": ecosystem,
                     "tier": tier,
                     "context_operator": operator,
@@ -2740,6 +2775,8 @@ def relational_twin_records(seed, per_lang, split):
                 claim = entry["claim"][lang].format(subject=subject, filler=filler)
                 metadata = {
                     "oracle": "relational tuple table",
+                    "verification": VERIFICATION_KINDS[TWIN_PAIR_RELATIONAL],
+                    "fact_basis": entry["basis"],
                     "operator": operator,
                     "tuple_key": entry["key"],
                     "subject": subject,
