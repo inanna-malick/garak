@@ -1151,10 +1151,13 @@ def build_code_instance(template, alias, rng):
     )
     canonical, candidates = candidate_mutations(sound_source, structural)
     rng.shuffle(candidates)
+    offered = len(candidates)
+    tried = 0
     fallback = None
     for label, mutated_source in candidates:
         if mutated_source == canonical:
             continue
+        tried += 1
         try:
             mutant = load_twin(mutated_source, alias)
         except SyntaxError:
@@ -1172,6 +1175,8 @@ def build_code_instance(template, alias, rng):
                 "template": template["key"],
                 "input_index": offset,
                 "canonical_inputs_checked": len(canonical_args),
+                "mutation_candidates_offered": offered,
+                "mutation_candidates_tried": tried,
             }
             if witness["reason"] == "step_budget_exceeded" and fallback is None:
                 fallback = (mutated_source, witness)
@@ -1184,6 +1189,8 @@ def build_code_instance(template, alias, rng):
                 "mutation": label,
                 "witness": witness,
                 "canonical_inputs_checked": len(canonical_args),
+                "mutation_candidates_offered": offered,
+                "mutation_candidates_tried": tried,
             }
     if fallback is not None:
         mutated_source, witness = fallback
@@ -1195,6 +1202,8 @@ def build_code_instance(template, alias, rng):
             "mutation": witness["mutation"],
             "witness": witness,
             "canonical_inputs_checked": len(canonical_args),
+            "mutation_candidates_offered": offered,
+            "mutation_candidates_tried": tried,
         }
     raise ParametricGenerationError(
         f"{template['key']}: no single-site mutation produced a counterexample"
@@ -2550,6 +2559,10 @@ def code_twin_records(seed, per_lang, split):
                     "verification": VERIFICATION_KINDS[TWIN_PAIR_CODE],
                     "oracle_inputs_checked": instance["canonical_inputs_checked"],
                     "ast_mutation": instance["mutation"] if hazard else "none",
+                    "mutation_candidates_offered": instance[
+                        "mutation_candidates_offered"
+                    ],
+                    "mutation_candidates_tried": instance["mutation_candidates_tried"],
                     "envelope": envelope,
                     "parametric_seed": seed,
                     "counterexample_witness": witness,

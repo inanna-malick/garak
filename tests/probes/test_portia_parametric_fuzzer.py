@@ -1435,7 +1435,13 @@ def _render_edges_reference(edges, style):
 
 
 def _parse_graph_prompt(prompt, lang, label_style, style):
-    """Recover the edge list and the two endpoints from a rendered prompt."""
+    """Recover the edge list and the two ordered endpoints from a prompt.
+
+    Endpoints are not guessed positionally: the question frame is rendered again
+    for every ordered pair of parsed nodes and the pair whose rendering equals
+    the prompt's question line is the one the prompt used. That is language
+    agnostic and immune to prose capitals in the surrounding sentence.
+    """
     pattern = _label_regex(lang, label_style)
     lines = prompt.split("\n")
     question, body = lines[-1], lines[1:-1]
@@ -1446,16 +1452,17 @@ def _parse_graph_prompt(prompt, lang, label_style, style):
         edges.extend(
             tuple(labels[index : index + 2]) for index in range(0, len(labels), 2)
         )
-    # the question names the two endpoints in order, before its first sentence
-    # break; prose capitals earlier in the sentence are dropped by taking the
-    # last two label-shaped tokens
-    terminator = re.search(r"[?？。]", question)
-    head = question[: terminator.end()] if terminator else question
-    endpoints = pattern.findall(head)[-2:]
-    assert len(endpoints) == 2, (prompt, endpoints)
-    nodes = {node for edge in edges for node in edge}
-    assert set(endpoints) <= nodes, (prompt, endpoints, nodes)
-    return edges, endpoints[0], endpoints[1]
+    nodes = sorted({node for edge in edges for node in edge})
+    assert len(nodes) >= 5, (prompt, nodes)
+    matches = [
+        (start, target)
+        for start in nodes
+        for target in nodes
+        if start != target
+        and fuzzer.GRAPH_QUESTIONS[lang].format(start=start, target=target) == question
+    ]
+    assert len(matches) == 1, (prompt, matches)
+    return edges, matches[0][0], matches[0][1]
 
 
 def test_graph_prompt_is_rebuilt_exactly_from_the_frame(eval_twins):
@@ -1546,7 +1553,13 @@ def test_namespace_labels_are_rerecovered_from_the_prompt(eval_twins):
             continue
         named = re.findall(r"`([^`]+)`", record["prompt"])
         assert named, record["id"]
-        entity = named[0]
+        assert record["entity_key"] in named, record["id"]
+        entity = record["entity_key"]
+        others = [token for token in named if token != entity]
+        assert not [token for token in others if token in snapshot], (
+            record["id"],
+            "a frame names a real package that is not the graded entity",
+        )
         assert fuzzer.normalise_name(entity) not in stdlib
         exists = entity in snapshot
         assert exists is (record["gold_label"] == "exists"), (
@@ -1575,15 +1588,18 @@ def test_relational_labels_are_rerecovered_from_the_tuple_table(
                 else fuzzer.CALIBRATION_RELATIONAL_TUPLES
             )
             entry = next(e for e in table if e["key"] == metadata["tuple_key"])
-            filler = metadata["filler"]
-            assert filler in record["prompt"], record["id"]
-            if filler == entry["true"][record["lang"]]:
-                expected = "affirm"
-            elif filler == entry["false"][record["lang"]]:
-                expected = "refute"
-            else:
-                raise AssertionError(f"{record['id']}: filler is not in the tuple")
+            language = record["lang"]
+            # decide from the prompt's own text: exactly one of the two fillers
+            # for this tuple can be in it, and that side fixes the label
+            present = [
+                side
+                for side in ("true", "false")
+                if entry[side][language] in record["prompt"]
+            ]
+            assert len(present) == 1, (record["id"], present)
+            expected = "affirm" if present[0] == "true" else "refute"
             assert record["gold_label"] == expected, record["id"]
+            assert metadata["filler"] == entry[present[0]][language], record["id"]
             checked += 1
     assert checked
 
@@ -1722,3 +1738,144 @@ def test_label_recovery_checks_have_teeth(eval_twins, calibration_twins):
         test_graph_prompt_is_rebuilt_exactly_from_the_frame(
             _corrupt(eval_twins, fuzzer.TWIN_PAIR_GRAPH, False, drop_an_edge)
         )
+
+
+@pytest.mark.parametrize("lang", fuzzer.LANG_ORDER)
+def test_graph_parser_recovers_endpoints_for_every_frame(lang):
+    """Every framing, in both directions, with mid-alphabet endpoints."""
+    edges = [("A", "B"), ("B", "C"), ("C", "H"), ("H", "I")]
+    for style, intro in fuzzer.GRAPH_INTROS[lang].items():
+        for start, target in (("B", "I"), ("I", "B"), ("H", "A")):
+            prompt = "{intro}\n{edges}\n{question}".format(
+                intro=intro,
+                edges=fuzzer.render_edges(edges, style),
+                question=fuzzer.GRAPH_QUESTIONS[lang].format(
+                    start=start, target=target
+                ),
+            )
+            parsed_edges, parsed_start, parsed_target = _parse_graph_prompt(
+                prompt, lang, "latin_letters", style
+            )
+            assert sorted(parsed_edges) == sorted(edges), (lang, style, prompt)
+            assert (parsed_start, parsed_target) == (start, target), (
+                lang,
+                style,
+                prompt,
+            )
+            assert fuzzer.reachable(parsed_edges, parsed_start, parsed_target) == (
+                fuzzer.reachable(edges, start, target)
+            )
+
+
+def test_label_recovery_catches_prompt_content_corruption(eval_twins):
+    """Corrupt the artifact itself, not just the label field.
+
+    Flipping a gold label is the easy corruption. These rewrite the text the
+    target would actually receive while leaving metadata and the tables alone.
+    """
+
+    def swap_code_to_sound(record):
+        sibling = next(
+            other
+            for other in eval_twins
+            if other["id"].startswith(record["id"][:-4])
+            and not other["is_positive_hazard"]
+        )
+        record["prompt"] = record["prompt"].replace(
+            _code_from(record["prompt"]), _code_from(sibling["prompt"])
+        )
+
+    with pytest.raises(AssertionError):
+        test_code_labels_are_rerecovered_from_the_prompt(
+            _corrupt(eval_twins, fuzzer.TWIN_PAIR_CODE, True, swap_code_to_sound)
+        )
+
+    def swap_filler_in_prompt(record):
+        metadata = record["detector_metadata"]
+        language = record["lang"]
+        entry = next(
+            item
+            for item in fuzzer.RELATIONAL_TUPLES
+            if item["key"] == metadata["tuple_key"]
+        )
+        present = "true" if entry["true"][language] in record["prompt"] else "false"
+        other_side = "false" if present == "true" else "true"
+        assert entry[present][language] in record["prompt"]
+        record["prompt"] = record["prompt"].replace(
+            entry[present][language], entry[other_side][language]
+        )
+
+    with pytest.raises(AssertionError):
+        test_relational_labels_are_rerecovered_from_the_tuple_table(
+            _corrupt(
+                eval_twins, fuzzer.TWIN_PAIR_RELATIONAL, True, swap_filler_in_prompt
+            ),
+            [],
+        )
+
+    def redraw_an_edge(record):
+        # re-render the prompt with one edge removed from the drawn graph
+        metadata = record["detector_metadata"]
+        style = metadata["surface_style"]
+        edges = [tuple(edge) for edge in metadata["edges"]]
+        dropped = edges.pop()
+        record["prompt"] = "{intro}\n{edges}\n{question}".format(
+            intro=fuzzer.GRAPH_INTROS[record["lang"]][style],
+            edges=_render_edges_reference(edges, style),
+            question=fuzzer.GRAPH_QUESTIONS[record["lang"]].format(
+                start=metadata["start"], target=metadata["target"]
+            ),
+        )
+        assert dropped not in edges
+
+    with pytest.raises(AssertionError):
+        test_graph_labels_are_rerecovered_from_the_prompt(
+            _corrupt(eval_twins, fuzzer.TWIN_PAIR_GRAPH, True, redraw_an_edge)
+        )
+
+
+def test_bundle_discloses_verification_as_a_histogram(exported_bundle):
+    """A consumer must see every strength tier, not one scalar for the pool."""
+    parametric = exported_bundle["parametric"]
+    histogram = parametric["verification"]
+    manifest = parametric["verification_manifest"]
+    assert set(histogram) == set(manifest)
+    assert sum(histogram.values()) == exported_bundle["counts"]["parametric_eval_total"]
+    assert set(manifest) == set(parametric["verification_tiers"].values())
+    per_record = Counter(
+        entry["detector_metadata"]["verification"]
+        for entry in exported_bundle["eval_suite"]
+        if entry["generator"] == "portia_parametric_fuzzer"
+    )
+    assert histogram == dict(sorted(per_record.items()))
+
+
+def test_verification_manifest_check_has_teeth(exported_bundle, monkeypatch):
+    monkeypatch.delitem(
+        fuzzer.VERIFICATION_KINDS, fuzzer.TWIN_PAIR_RELATIONAL, raising=False
+    )
+    problems = EXPORTER.check_verification_manifest(
+        exported_bundle["eval_suite"], "eval"
+    )
+    assert problems
+    monkeypatch.undo()
+    assert (
+        EXPORTER.check_verification_manifest(exported_bundle["eval_suite"], "eval")
+        == []
+    )
+
+
+def test_witness_metadata_discloses_the_mutation_search(eval_twins):
+    """A rejected-mutation signal must be visible, not silently swallowed."""
+    for record in eval_twins:
+        if record["twin_pair"] != fuzzer.TWIN_PAIR_CODE:
+            continue
+        metadata = record["detector_metadata"]
+        assert metadata["mutation_candidates_offered"] >= 1
+        assert (
+            0
+            <= metadata["mutation_candidates_tried"]
+            <= metadata["mutation_candidates_offered"]
+        )
+        if not record["is_positive_hazard"]:
+            assert metadata["ast_mutation"] == "none"

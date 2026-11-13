@@ -250,7 +250,9 @@ def check_parametric_oracles(entries, label):
     by_pair = defaultdict(list)
     for entry in parametric:
         metadata = entry["detector_metadata"]
-        if metadata.get("verification") != fuzzer.VERIFICATION_KINDS[entry["twin_pair"]]:
+        if metadata.get("verification") != fuzzer.VERIFICATION_KINDS.get(
+            entry["twin_pair"]
+        ):
             problems.append(
                 f"{entry['id']}: verification strength is not disclosed for its twin pair"
             )
@@ -258,7 +260,9 @@ def check_parametric_oracles(entries, label):
             witness = metadata.get("counterexample_witness")
             if entry["is_positive_hazard"]:
                 if not witness:
-                    problems.append(f"{entry['id']}: defective twin has no counterexample")
+                    problems.append(
+                        f"{entry['id']}: defective twin has no counterexample"
+                    )
                     continue
                 for field in ("reason", "args", "expected", "observed", "mutation"):
                     if not witness.get(field):
@@ -291,7 +295,10 @@ def check_parametric_oracles(entries, label):
             problems.append(f"{key}: twins disagree on their twin pair")
             continue
         if hazard["twin_pair"] == fuzzer.TWIN_PAIR_GRAPH:
-            hazard_meta, safe_meta = hazard["detector_metadata"], safe["detector_metadata"]
+            hazard_meta, safe_meta = (
+                hazard["detector_metadata"],
+                safe["detector_metadata"],
+            )
             if safe_meta["edge_count"] != hazard_meta["edge_count"] + 1:
                 problems.append(f"{key}: bridge twin is not exactly one edge longer")
             if safe_meta["nodes"] != hazard_meta["nodes"]:
@@ -301,11 +308,16 @@ def check_parametric_oracles(entries, label):
             if not 3 <= (safe_meta["shortest_path_length"] or 0) <= 6:
                 problems.append(f"{key}: bridge distance is outside [3, 6]")
         elif hazard["twin_pair"] == fuzzer.TWIN_PAIR_RELATIONAL:
-            hazard_meta, safe_meta = hazard["detector_metadata"], safe["detector_metadata"]
+            hazard_meta, safe_meta = (
+                hazard["detector_metadata"],
+                safe["detector_metadata"],
+            )
             left = hazard["prompt"].replace(hazard_meta["filler"], "\x00")
             right = safe["prompt"].replace(safe_meta["filler"], "\x00")
             if left != right:
-                problems.append(f"{key}: relational twins differ outside the filled slot")
+                problems.append(
+                    f"{key}: relational twins differ outside the filled slot"
+                )
             if hazard_meta["operator"] != safe_meta["operator"]:
                 problems.append(f"{key}: relational twins disagree on their operator")
         elif hazard["twin_pair"] == fuzzer.TWIN_PAIR_CODE:
@@ -330,6 +342,45 @@ def check_parametric_seeded_regularity(entries, label):
                 f"{label} parametric {pair} in {lang}: {counts['hazard']} hazard vs "
                 f"{counts['benign']} benign"
             )
+    return problems
+
+
+def check_verification_manifest(entries, label):
+    """Every strength tier in use must be counted and named in the manifest."""
+    problems = []
+    parametric = [
+        entry
+        for entry in entries
+        if entry.get("generator") == "portia_parametric_fuzzer"
+    ]
+    if not parametric:
+        return problems
+    known = set(fuzzer.VERIFICATION_KINDS.values())
+    seen = Counter()
+    for entry in parametric:
+        tier = entry["detector_metadata"].get("verification")
+        if tier not in known:
+            problems.append(f"{entry['id']}: unknown verification tier {tier!r}")
+            continue
+        seen[tier] += 1
+    expected = set()
+    for entry in parametric:
+        tier = fuzzer.VERIFICATION_KINDS.get(entry["twin_pair"])
+        if tier is None:
+            problems.append(
+                f"{entry['id']}: twin pair has no declared verification tier"
+            )
+            continue
+        expected.add(tier)
+    if set(seen) != expected:
+        problems.append(
+            f"{label}: verification manifest {sorted(seen)} does not cover the "
+            f"tiers actually recorded {sorted(expected)}"
+        )
+    if sum(seen.values()) != len(parametric):
+        problems.append(
+            f"{label}: verification histogram does not sum to the record count"
+        )
     return problems
 
 
@@ -384,7 +435,9 @@ def check_calibration_coverage(entries):
     return problems
 
 
-def build_bundle(eval_entries, calibration_entries, seed=None, per_family_per_lang=None):
+def build_bundle(
+    eval_entries, calibration_entries, seed=None, per_family_per_lang=None
+):
     """Assemble the export payload from the two already-collected pools."""
     by_family = Counter(entry["family"] for entry in eval_entries)
     parametric_eval = [
@@ -416,7 +469,23 @@ def build_bundle(eval_entries, calibration_entries, seed=None, per_family_per_la
                 fuzzer.DEFAULT_CALIBRATION_PER_FAMILY_PER_LANG
             ),
             "twin_pairs": list(fuzzer.PARAMETRIC_TWIN_PAIRS),
-            "verification": dict(fuzzer.VERIFICATION_KINDS),
+            # a histogram plus a manifest, so a consumer cannot read a single
+            # strength tier and apply it to records verified more weakly
+            "verification": dict(
+                sorted(
+                    Counter(
+                        entry["detector_metadata"]["verification"]
+                        for entry in parametric_eval
+                    ).items()
+                )
+            ),
+            "verification_tiers": dict(fuzzer.VERIFICATION_KINDS),
+            "verification_manifest": sorted(
+                {
+                    entry["detector_metadata"]["verification"]
+                    for entry in parametric_eval
+                }
+            ),
             "oracles": {
                 fuzzer.TWIN_PAIR_CODE: "independent reference function, executed",
                 fuzzer.TWIN_PAIR_GRAPH: "exact breadth-first search",
@@ -527,6 +596,8 @@ def main():
     problems += check_parametric_oracles(calibration_entries, "calibration")
     problems += check_parametric_seeded_regularity(eval_entries, "eval")
     problems += check_parametric_seeded_regularity(calibration_entries, "calibration")
+    problems += check_verification_manifest(eval_entries, "eval")
+    problems += check_verification_manifest(calibration_entries, "calibration")
     by_family = Counter(entry["family"] for entry in eval_entries)
     for family, minimum in MINIMUMS.items():
         if by_family[family] < minimum:
@@ -543,7 +614,10 @@ def main():
         raise SystemExit(1)
 
     bundle = build_bundle(
-        eval_entries, calibration_entries, args.seed, args.parametric_per_family_per_lang
+        eval_entries,
+        calibration_entries,
+        args.seed,
+        args.parametric_per_family_per_lang,
     )
 
     write_bundle(bundle, args.output)
