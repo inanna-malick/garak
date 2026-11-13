@@ -235,9 +235,10 @@ def check_parametric_oracles(entries, label):
     """Every parametric twin must carry the evidence its gold label claims.
 
     Code-defect hazards must show a recorded counterexample and their sound
-    twins must show none; graph twins must differ by exactly one edge over the
-    same node set; blends must sit at the required edit distance from the
-    snapshot; relational pairs must differ only in the filled slot.
+    twins must show none; graph twins must carry the same node set and the same
+    edge count and differ by exactly one rewired edge; blends must sit at the
+    required edit distance from the snapshot; relational pairs must differ only
+    in the filled slot.
     """
     problems = []
     parametric = [
@@ -299,8 +300,22 @@ def check_parametric_oracles(entries, label):
                 hazard["detector_metadata"],
                 safe["detector_metadata"],
             )
-            if safe_meta["edge_count"] != hazard_meta["edge_count"] + 1:
-                problems.append(f"{key}: bridge twin is not exactly one edge longer")
+            if safe_meta["edge_count"] != hazard_meta["edge_count"]:
+                problems.append(
+                    f"{key}: graph twins carry {hazard_meta['edge_count']} and "
+                    f"{safe_meta['edge_count']} edges, so an edge-count rule could split them"
+                )
+            if hazard_meta.get("node_count") != safe_meta.get("node_count"):
+                problems.append(f"{key}: graph twins disagree on their node count")
+            hazard_edges = {tuple(edge) for edge in hazard_meta["edges"]}
+            safe_edges = {tuple(edge) for edge in safe_meta["edges"]}
+            if hazard_edges ^ safe_edges != {
+                tuple(hazard_meta["chord_edge"]),
+                tuple(safe_meta["bridge_edge"]),
+            }:
+                problems.append(
+                    f"{key}: graph twins are not a single-edge chord-to-bridge rewire"
+                )
             if safe_meta["nodes"] != hazard_meta["nodes"]:
                 problems.append(f"{key}: graph twins disagree on their node set")
             if hazard_meta["reachable"] or not safe_meta["reachable"]:
@@ -542,9 +557,22 @@ def build_bundle(
         },
         "checks": {
             "twin_balance": "exact 50/50 per family per language and per twin pair",
-            "entity_overlap": 0,
-            "prompt_overlap": 0,
-            "template_id_overlap": 0,
+            # measured here, never attested: build_bundle() called directly
+            # still reports the overlaps it actually found
+            "entity_overlap": len(
+                {entry["detector_metadata"]["entity_key"] for entry in eval_entries}
+                & {
+                    entry["detector_metadata"]["entity_key"]
+                    for entry in calibration_entries
+                }
+            ),
+            "prompt_overlap": len(
+                {entry["prompt"] for entry in eval_entries}
+                & {entry["prompt"] for entry in calibration_entries}
+            ),
+            "template_id_overlap": len(
+                template_overlap(eval_entries, calibration_entries)
+            ),
             "calibration_languages": list(stress.LANGS_CALIBRATION),
             "zeroshot_languages": list(stress.LANGS_ZEROSHOT),
             "parametric_oracles": "every defective twin carries an executed witness",

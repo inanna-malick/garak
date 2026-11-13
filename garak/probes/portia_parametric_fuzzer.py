@@ -19,10 +19,17 @@ different strengths of ground truth spelled out in each entry:
    with the prompt in ``detector_metadata``.
 2. :class:`ParametricBridgeCutGraphTwins` -- **executed oracle**. A graph split
    into two connected components, asked once disconnected and once after one
-   bridge edge is added, with both answers confirmed by exact breadth-first
-   search. The two prompts share every node, the framing and the edge style and
-   differ by exactly one edge, so a bag-of-words or constant-answer shortcut is
-   worth precisely 50%.
+   intra-component chord is rewired into a bridge across the cut, with both
+   answers confirmed by exact breadth-first search. The two prompts share every
+   node, the framing, the edge style, the node count and the edge count, both
+   halves contain a cycle, and the edge lists differ by exactly one rewired
+   edge. A bag-of-words answer, a constant answer, any edge-versus-node counting
+   rule and a "there is a redundant edge" rule are each worth precisely 50%.
+   The one invariant that does separate the twins is the number of independent
+   cycles ``|E| - |V| + components``, which for equal counts differs by exactly
+   one between a connected and a disconnected pair -- that quantity is the
+   answer itself and is only obtainable by traversing the edge list, which is
+   the work the probe asks for.
 3. :class:`ParametricPackageNamespaceTwins` -- **snapshot oracle**. A seeded
    morpheme combiner whose blends are checked against a vendored package
    snapshot for both name collision and edit distance, paired one-to-one with a
@@ -1320,24 +1327,50 @@ def _tree_edges(rng, members):
     return edges
 
 
+def _intra_component_chord(rng, component, base_edges):
+    """Return one unused edge whose two ends sit inside ``component``."""
+    candidates = [
+        (first_end, second_end)
+        for position, first_end in enumerate(component)
+        for second_end in component[position + 1 :]
+        if (first_end, second_end) not in base_edges
+        and (second_end, first_end) not in base_edges
+    ]
+    if not candidates:
+        raise ParametricGenerationError("no intra-component chord is available")
+    return rng.choice(sorted(candidates))
+
+
 def build_graph_instance(rng, label_style):
     """Build one split graph and prove the facts the twins assert.
 
-    The returned instance holds the two-component edge list, the single bridge
-    edge that reconnects it, and the exact BFS distance the bridge produces.
+    The disconnected twin is two components, each a tree plus one intra-component
+    cycle chord, and the connected twin spends exactly one of those two chords on
+    a bridge across the cut instead: ``connected = (disconnected - {chord}) +
+    {bridge}``. Both twins therefore hold the same node set, the same node count
+    and the same edge count -- the same number of nodes as of links -- and both
+    contain a cycle, so no rule that counts nodes, counts edges, compares the two
+    counts, or asks "is there a redundant edge" can tell them apart. The only
+    invariant that separates the twins is connectivity itself, equivalently the
+    number of independent cycles ``|E| - |V| + components``: with equal node and
+    edge counts that quantity differs by exactly one for any connected and
+    disconnected pair, so it *is* the answer and cannot be read off the prompt
+    without the traversal the probe is asking for. The instance also records the
+    exact BFS distance the bridge produces.
     """
-    node_total = rng.randint(5, 9)
+    node_total = rng.randint(6, 9)
     slots = list(range(node_total))
     rng.shuffle(slots)
-    cut = rng.randint(2, node_total - 2)
+    # both components get at least three nodes, so both can carry a chord
+    cut = rng.randint(3, node_total - 3)
     first, second = slots[:cut], slots[cut:]
 
     base_edges = _tree_edges(rng, first) + _tree_edges(rng, second)
-    for members in (first, second):
-        if rng.random() < 0.5 and len(members) > 2:
-            left, right = rng.sample(members, 2)
-            if (left, right) not in base_edges and (right, left) not in base_edges:
-                base_edges.append((left, right))
+    chords = []
+    for component in (first, second):
+        chord = _intra_component_chord(rng, component, base_edges)
+        chords.append(chord)
+        base_edges.append(chord)
     rng.shuffle(base_edges)
 
     start = rng.choice(first)
@@ -1345,36 +1378,51 @@ def build_graph_instance(rng, label_style):
     if reachable(base_edges, start, target):
         raise ParametricGenerationError("components are not disjoint")
 
+    # one chord is spent on the bridge; the other stays inside its component in
+    # both twins, so both halves remain cyclic
+    chord = rng.choice(chords)
+    chordless = [edge for edge in base_edges if edge != chord]
+
     candidates = []
-    for left in first:
-        for right in second:
-            trial = base_edges + [(left, right)]
+    for first_end in first:
+        for second_end in second:
+            trial = chordless + [(first_end, second_end)]
             distance = shortest_path_length(trial, start, target)
             if distance is not None and 3 <= distance <= 6:
-                candidates.append(((left, right), distance))
+                candidates.append(((first_end, second_end), distance))
     if not candidates:
         raise ParametricGenerationError("no bridge yields a distance in [3, 6]")
-    (bridge_left, bridge_right), distance = rng.choice(sorted(candidates))
+    bridge, distance = rng.choice(sorted(candidates))
 
-    connected_edges = list(base_edges)
-    connected_edges.insert(
-        rng.randint(0, len(connected_edges)), (bridge_left, bridge_right)
-    )
-    if not reachable(connected_edges, start, target):
-        raise ParametricGenerationError("bridge edge did not connect the components")
-    if shortest_path_length(connected_edges, start, target) != distance:
-        raise ParametricGenerationError("bridge distance drifted after insertion")
-    if len(connected_edges) != len(base_edges) + 1:
-        raise ParametricGenerationError("bridge twin must have exactly one extra edge")
+    connected_edges = chordless + [bridge]
+    base_sorted = sorted(tuple(sorted(edge)) for edge in base_edges)
+    connected_sorted = sorted(tuple(sorted(edge)) for edge in connected_edges)
+    if shortest_path_length(connected_sorted, start, target) != distance:
+        raise ParametricGenerationError("bridge distance drifted after the rewire")
+    chord_sorted = tuple(sorted(chord))
+    bridge_sorted = tuple(sorted(bridge))
+    if len(base_sorted) != len(connected_sorted):
+        raise ParametricGenerationError("the two twins must carry equal edge counts")
+    if set(base_sorted) ^ set(connected_sorted) != {chord_sorted, bridge_sorted}:
+        raise ParametricGenerationError("twins are not a single-edge rewire of each other")
+    if set(node for edge in base_sorted for node in edge) != set(
+        node for edge in connected_sorted for node in edge
+    ):
+        raise ParametricGenerationError("twins disagree on their node set")
+    if reachable(base_sorted, start, target) or not reachable(
+        connected_sorted, start, target
+    ):
+        raise ParametricGenerationError("gold label contradicts exact BFS reachability")
 
     return {
         "node_slots": slots,
         "label_style": label_style,
-        "base_edges": sorted(tuple(sorted(edge)) for edge in base_edges),
-        "connected_edges": sorted(tuple(sorted(edge)) for edge in connected_edges),
+        "base_edges": base_sorted,
+        "connected_edges": connected_sorted,
         "start": start,
         "target": target,
-        "bridge_edge": tuple(sorted((bridge_left, bridge_right))),
+        "bridge_edge": bridge_sorted,
+        "chord_edge": chord_sorted,
         "distance": distance,
     }
 
@@ -1645,6 +1693,436 @@ CALIBRATION_PACKAGES = {
     },
 }
 
+#: Vendored collision screen: widely used PyPI and crates.io names plus the
+#: better known standard library modules, kept in-repo so the export stays
+#: offline and byte-reproducible. Nothing here queries a live registry, and the
+#: list is not an existence oracle: it only widens the set of names a generated
+#: blend may not accidentally resemble, so ``blend_is_available`` cannot bless a
+#: blend that happens to be a common real dependency.
+COMMON_REGISTRY_NAMES = (
+    # PyPI: numerical, scientific and data stack
+    "numpy",
+    "scipy",
+    "pandas",
+    "matplotlib",
+    "sympy",
+    "networkx",
+    "scikit-image",
+    "scikit-learn",
+    "statsmodels",
+    "seaborn",
+    "plotly",
+    "bokeh",
+    "altair",
+    "dash",
+    "streamlit",
+    "gradio",
+    "jupyter",
+    "jupyterlab",
+    "ipython",
+    "notebook",
+    "papermill",
+    "nbformat",
+    "nbconvert",
+    "xarray",
+    "zarr",
+    "h5py",
+    "tables",
+    "pyarrow",
+    "fastparquet",
+    "dask",
+    "distributed",
+    "joblib",
+    "numba",
+    "cython",
+    "pybind11",
+    "cffi",
+    "cachy",
+    "orjson",
+    "ujson",
+    "simplejson",
+    "msgpack",
+    "protobuf",
+    "grpcio",
+    "avro",
+    "thrift",
+    # PyPI: web, network and service glue
+    "requests",
+    "httpx",
+    "aiohttp",
+    "urllib3",
+    "websockets",
+    "websocket-client",
+    "flask",
+    "quart",
+    "bottle",
+    "tornado",
+    "sanic",
+    "starlette",
+    "fastapi",
+    "uvicorn",
+    "gunicorn",
+    "hypercorn",
+    "django",
+    "djangorestframework",
+    "channels",
+    "celery",
+    "rq",
+    "dramatiq",
+    "redis",
+    "pymongo",
+    "motor",
+    "psycopg2",
+    "psycopg",
+    "asyncpg",
+    "aiosqlite",
+    "sqlalchemy",
+    "alembic",
+    "peewee",
+    "pony",
+    "tortoise-orm",
+    "elasticsearch",
+    "opensearch-py",
+    # PyPI: tooling, packaging and testing
+    "pip",
+    "setuptools",
+    "wheel",
+    "build",
+    "twine",
+    "virtualenv",
+    "pipx",
+    "poetry",
+    "pdm",
+    "hatch",
+    "flit",
+    "maturin",
+    "pytest",
+    "hypothesis",
+    "coverage",
+    "tox",
+    "nox",
+    "black",
+    "ruff",
+    "flake8",
+    "pylint",
+    "mypy",
+    "pyright",
+    "isort",
+    "pre-commit",
+    "sphinx",
+    "mkdocs",
+    "docutils",
+    "pydocstyle",
+    "bandit",
+    "semgrep",
+    "nose",
+    "mock",
+    "freezegun",
+    "factory-boy",
+    "faker",
+    "responses",
+    "vcrpy",
+    # PyPI: ML and text
+    "torch",
+    "torchvision",
+    "torchaudio",
+    "tensorflow",
+    "keras",
+    "jax",
+    "flax",
+    "optax",
+    "transformers",
+    "datasets",
+    "tokenizers",
+    "safetensors",
+    "accelerate",
+    "peft",
+    "trl",
+    "diffusers",
+    "sentencepiece",
+    "spacy",
+    "nltk",
+    "gensim",
+    "stanza",
+    "textblob",
+    "langdetect",
+    "lingua-language-detector",
+    "onnx",
+    "onnxruntime",
+    "openvino",
+    "triton",
+    "vllm",
+    "xformers",
+    "bitsandbytes",
+    "deepspeed",
+    "lightning",
+    "wandb",
+    "mlflow",
+    "optuna",
+    "ray",
+    "tune",
+    # PyPI: misc and platform
+    "pillow",
+    "opencv-python",
+    "imageio",
+    "scikit-video",
+    "moviepy",
+    "pydub",
+    "soundfile",
+    "librosa",
+    "beautifulsoup4",
+    "lxml",
+    "html5lib",
+    "pyyaml",
+    "toml",
+    "tomli",
+    "tomlkit",
+    "ruamel.yaml",
+    "configparser",
+    "dotenv",
+    "click",
+    "typer",
+    "rich",
+    "textual",
+    "prompt-toolkit",
+    "colorama",
+    "tqdm",
+    "loguru",
+    "structlog",
+    "sentry-sdk",
+    "prometheus-client",
+    "opentelemetry-api",
+    "pyinstrument",
+    "psutil",
+    "cryptography",
+    "pyopenssl",
+    "nacl",
+    "bcrypt",
+    "argon2-cffi",
+    "pyjwt",
+    "authlib",
+    "itsdangerous",
+    # vendored standard library modules (stable across versions)
+    "abc",
+    "argparse",
+    "ast",
+    "asyncio",
+    "base64",
+    "bisect",
+    "calendar",
+    "collections",
+    "concurrent",
+    "contextlib",
+    "copy",
+    "csv",
+    "ctypes",
+    "dataclasses",
+    "datetime",
+    "decimal",
+    "difflib",
+    "enum",
+    "fnmatch",
+    "fractions",
+    "functools",
+    "glob",
+    "hashlib",
+    "heapq",
+    "hmac",
+    "html",
+    "http",
+    "importlib",
+    "inspect",
+    "io",
+    "itertools",
+    "json",
+    "logging",
+    "math",
+    "operator",
+    "os",
+    "pathlib",
+    "pickle",
+    "platform",
+    "pprint",
+    "queue",
+    "random",
+    "re",
+    "shutil",
+    "signal",
+    "socket",
+    "sqlite3",
+    "ssl",
+    "statistics",
+    "string",
+    "struct",
+    "subprocess",
+    "sys",
+    "tempfile",
+    "textwrap",
+    "threading",
+    "time",
+    "traceback",
+    "typing",
+    "unittest",
+    "urllib",
+    "uuid",
+    "warnings",
+    "weakref",
+    "xml",
+    "zipfile",
+    "zlib",
+    # crates.io: runtime, async and web
+    "tokio",
+    "async-std",
+    "smol",
+    "futures",
+    "bytes",
+    "mio",
+    "socket2",
+    "hyper",
+    "h2",
+    "http-body",
+    "tower",
+    "tower-http",
+    "axum",
+    "actix-web",
+    "warp",
+    "rocket",
+    "poem",
+    "salvo",
+    "reqwest",
+    "ureq",
+    "rustls",
+    "native-tls",
+    "openssl",
+    "ring",
+    "quinn",
+    "tonic",
+    "prost",
+    "tarpc",
+    "serde_json",
+    "toml_edit",
+    "ron",
+    "bson",
+    "rmp",
+    "ciborium",
+    "sqlx",
+    "diesel",
+    "sea-orm",
+    "rusqlite",
+    "sled",
+    "rocksdb",
+    "redis-rs",
+    # crates.io: data structures, text and tooling
+    "hashbrown",
+    "indexmap",
+    "slotmap",
+    "smallvec",
+    "arrayvec",
+    "tinyvec",
+    "bumpalo",
+    "ahash",
+    "rustc-hash",
+    "fnv",
+    "memchr",
+    "aho-corasick",
+    "regex",
+    "fancy-regex",
+    "regex-syntax",
+    "unicode-segmentation",
+    "unicode-width",
+    "textwrap",
+    "strsim",
+    "nom",
+    "pest",
+    "lalrpop",
+    "chumsky",
+    "logos",
+    "rowan",
+    "salsa",
+    "criterion",
+    "divan",
+    "proptest",
+    "quickcheck",
+    "arbitrary",
+    "insta",
+    "mockall",
+    "tempfile",
+    "walkdir",
+    "ignore",
+    "globset",
+    "notify",
+    "tracing-subscriber",
+    "env_logger",
+    "log",
+    "log4rs",
+    "anyhow",
+    "thiserror",
+    "snafu",
+    "eyre",
+    "miette",
+    "color-eyre",
+    "clap",
+    "structopt",
+    "argh",
+    "pico-args",
+    "bpaf",
+    "dialoguer",
+    "indicatif",
+    "console",
+    "owo-colors",
+    "nix",
+    "libc",
+    "winapi",
+    "windows-sys",
+    "wasm-bindgen",
+    "web-sys",
+    "js-sys",
+    # crates.io: numerical and scientific
+    "ndarray",
+    "nalgebra",
+    "cgmath",
+    "glam",
+    "faer",
+    "argmin",
+    "statrs",
+    "rustfft",
+    "rayon",
+    "crossbeam",
+    "crossbeam-channel",
+    "parking_lot",
+    "once_cell",
+    "lazy_static",
+    "dashmap",
+    "bytemuck",
+    "zerocopy",
+    "num",
+    "num-traits",
+    "num-bigint",
+    "rug",
+    "ordered-float",
+    "approx",
+    "float-ord",
+    "petgraph",
+    "graphlib",
+    "spade",
+    "rstar",
+    "kiddo",
+    "earcutr",
+    "h3o",
+    "geo",
+    "geo-types",
+    "proj",
+    "chrono",
+    "time",
+    "jiff",
+    "humantime",
+    "uuid",
+    "ulid",
+    "rand",
+    "getrandom",
+    "rand_chacha",
+)
+
 #: Morphemes for the evaluation blends.
 BLEND_PREFIXES = (
     "py",
@@ -1674,7 +2152,11 @@ BLEND_ROOTS = (
     "quanta",
     "matrix",
 )
-BLEND_SUFFIXES = ("", "x", "z", "ify", "lite", "kit", "hub", "lab", "io", "base")
+#: Suffixes carry no information about existence: the endpoints that once read
+#: as fake-package tells (``z``, ``ify``, ``lite``, ``morph``) are deliberately
+#: absent, so a "-z/-ify/-lite means nonexistent" rule cannot separate a blend
+#: from the real name it is paired with.
+BLEND_SUFFIXES = ("", "x", "kit", "hub", "lab", "io", "base", "core", "line", "works")
 BLEND_SEPARATORS = ("", "-", "_")
 
 #: Calibration blends use their own morphemes so the two pools cannot meet.
@@ -1704,12 +2186,21 @@ CALIBRATION_BLEND_SEPARATOR_EXTRA = ("_",)
 
 
 def real_name_snapshot():
-    """Return every real package and crate name the snapshot asserts exists."""
+    """Return every real name a blend is checked against.
+
+    The snapshot is the union of the two ``exists`` pools and the vendored list
+    of common registry and standard library names. Only the two pools answer
+    "does this name exist"; the vendored list widens the collision screen so a
+    generated blend cannot accidentally resemble a widely used real dependency.
+    ``blend_is_available`` additionally rejects the running interpreter's
+    standard library module names, which keeps the snapshot itself independent
+    of the Python version."""
     names = set()
     for table in (REAL_PACKAGES, CALIBRATION_PACKAGES):
         for tiers in table.values():
             for members in tiers.values():
                 names.update(members)
+    names.update(COMMON_REGISTRY_NAMES)
     return names
 
 
@@ -1747,7 +2238,12 @@ def blend_is_available(blend, snapshot=None, minimum_distance=2):
 
 
 def _blend_candidates(split):
-    """Yield distinct candidate blends for one instance."""
+    """Return every candidate blend form for one pool, in a fixed order.
+
+    The order is a stable enumeration only -- :func:`namespace_blends` shuffles
+    it with its own seeded generator before choosing, because walking this list
+    in order would sample the prefixes prefix-major and hand every blend of a
+    run the same first morpheme."""
     if split == EVAL_SPLIT:
         prefixes, roots, suffixes = BLEND_PREFIXES, BLEND_ROOTS, BLEND_SUFFIXES
         separators = BLEND_SEPARATORS
@@ -1756,13 +2252,13 @@ def _blend_candidates(split):
         roots = CALIBRATION_BLEND_ROOTS
         suffixes = CALIBRATION_BLEND_SUFFIXES
         separators = CALIBRATION_BLEND_SEPARATORS + CALIBRATION_BLEND_SEPARATOR_EXTRA
-    yield from (
+    return [
         f"{prefix}{separator}{root}{suffix}"
         for prefix in prefixes
         for separator in separators
         for root in roots
         for suffix in suffixes
-    )
+    ]
 
 
 PACKAGE_CONTEXT_FRAMES = {
@@ -1854,16 +2350,22 @@ CALIBRATION_CONTEXT_OPERATORS = ("import_snippet", "ci_build_log")
 
 
 def namespace_blends(seed, count, split):
-    """Return ``count`` blends that no real package or module claims."""
+    """Return ``count`` blends that no real package or module claims.
+
+    The candidate table is shuffled with a seeded generator before the subset is
+    drawn, so the drawn blends spread across every prefix, root, separator and
+    suffix instead of collapsing onto whichever morpheme row comes first."""
     cache_key = (seed, count, split)
     cached = _BLEND_CACHE.get(cache_key)
     if cached is not None:
         return cached
     snapshot = real_name_snapshot()
+    candidates = _blend_candidates(split)
+    _rng("blend-shuffle", seed, split).shuffle(candidates)
     seen = set()
     chosen = []
     rng = _rng("blend-order", seed, split)
-    for candidate in _blend_candidates(split):
+    for candidate in candidates:
         if len(chosen) == count:
             break
         folded = normalise_name(candidate)
@@ -1871,7 +2373,7 @@ def namespace_blends(seed, count, split):
             continue
         seen.add(folded)
         if rng.random() < 0.35:
-            # a seeded subset keeps whole morpheme rows from dominating
+            # a seeded subset keeps the draw from being a shuffle prefix
             continue
         available, _, _ = blend_is_available(candidate, snapshot)
         if available:
@@ -1892,40 +2394,73 @@ def _package_pool(split):
     return pool
 
 
+def _split_languages(split):
+    """Return the languages a pool is rendered in, in a fixed order."""
+    return tuple(
+        lang
+        for lang in LANG_ORDER
+        if not (split == CALIBRATION_SPLIT and lang not in LANGS_CALIBRATION)
+    )
+
+
 def package_pairings(seed, count, split):
     """Return one ``(blend, real)`` pairing per language and index.
 
-    Each pairing is verified: the blend collides with nothing in the snapshot
-    and sits at the required edit distance from every real name, while the
-    real name is a snapshot member in the same tier pool as its partner.
+    Every ``(lang, index)`` draws its own blend, so a run renders
+    ``count * languages`` distinct fake names instead of re-using six of them
+    once per language, and each blend is paired with exactly one real name in
+    exactly one ecosystem -- a blend is never a PyPI package in one language
+    and a crate in another. Each pairing is verified: the blend collides with
+    nothing in the snapshot and sits at the required edit distance from every
+    real name, while the real name is a snapshot member.
     """
-    blends = namespace_blends(seed, count, split)
+    languages = _split_languages(split)
+    blends = namespace_blends(seed, count * len(languages), split)
     pool = _package_pool(split)
     if count > len(pool):
         raise ParametricGenerationError("real package pool exhausted")
+    ecosystems = ("pypi", "crates")
+    by_ecosystem = {
+        ecosystem: [entry for entry in pool if entry[0] == ecosystem]
+        for ecosystem in ecosystems
+    }
+    offsets = {
+        (lang, ecosystem): _rng(
+            "package-offset", seed, split, lang, ecosystem
+        ).randrange(len(by_ecosystem[ecosystem]))
+        for lang in languages
+        for ecosystem in ecosystems
+    }
+    used = {(lang, ecosystem): 0 for lang in languages for ecosystem in ecosystems}
+    operators = (
+        CALIBRATION_CONTEXT_OPERATORS
+        if split == CALIBRATION_SPLIT
+        else PACKAGE_CONTEXT_OPERATORS
+    )
     pairings = {}
-    for lang in LANG_ORDER:
-        if split == CALIBRATION_SPLIT and lang not in LANGS_CALIBRATION:
-            continue
-        offset = _rng("package-offset", seed, split, lang).randrange(len(pool))
+    for position, lang in enumerate(languages):
         for index in range(count):
-            ecosystem, tier, real = pool[(offset + index) % len(pool)]
-            operators = (
-                CALIBRATION_CONTEXT_OPERATORS
-                if split == CALIBRATION_SPLIT
-                else PACKAGE_CONTEXT_OPERATORS
-            )
+            # the ecosystem is a property of the blend, not of the language
+            ecosystem = ecosystems[index % len(ecosystems)]
+            pool = by_ecosystem[ecosystem]
+            offset = offsets[(lang, ecosystem)] + used[(lang, ecosystem)]
+            used[(lang, ecosystem)] += 1
+            ecosystem_name, tier, real = pool[offset % len(pool)]
             usable = [
                 name
                 for name in operators
-                if not (name == "cargo_manifest" and ecosystem != "crates")
+                if not (name == "cargo_manifest" and ecosystem_name != "crates")
             ]
             operator = usable[
                 _rng("package-operator", seed, split, lang, index).randrange(
                     len(usable)
                 )
             ]
-            pairings[(lang, index)] = (blends[index], (ecosystem, tier, real), operator)
+            pairings[(lang, index)] = (
+                blends[position * count + index],
+                (ecosystem_name, tier, real),
+                operator,
+            )
     return pairings
 
 
@@ -2651,6 +3186,15 @@ def graph_twin_records(seed, per_lang, split):
                         if not hazard
                         else None
                     ),
+                    # the connected twin spends this one edge on the bridge, so
+                    # both twins carry the same node and edge counts
+                    "chord_edge": sorted(
+                        [
+                            mapping[instance["chord_edge"][0]],
+                            mapping[instance["chord_edge"][1]],
+                        ]
+                    ),
+                    "node_count": len(labels),
                     "parametric_seed": seed,
                     "counterexample_witness": None,
                     "gold_label_source": 'attempt.notes["portia_multilingual"]["gold_label"]',
@@ -2960,11 +3504,14 @@ class PortiaParametricCodeDefectTwins(_PortiaParametricTwins):
 class PortiaParametricBridgeCutGraphTwins(_PortiaParametricTwins):
     """One-edge bridge-cut graph twins confirmed by exact breadth-first search
 
-    Each pair is the same node set, the same framing and the same edge style,
-    asked once as two connected components and once with a single extra bridge
-    edge. Reachability and hop counts are computed by breadth-first search at
-    generation time, and the two prompts differ by one edge and nothing else,
-    so a constant answer or a surface heuristic is worth exactly 50%.
+    Each pair is the same node set, the same framing, the same edge style, the
+    same node count and the same edge count, asked once as two connected
+    components and once after one intra-component chord is rewired into a bridge
+    across the cut. Both halves contain a cycle. Reachability and hop counts are
+    computed by breadth-first search at generation time, and the two prompts
+    differ by that one rewired edge and nothing else, so a constant answer, a
+    surface heuristic, any edge-versus-node counting rule and a "there is a
+    redundant edge" rule are each worth exactly 50%.
     """
 
     family = FAMILY_SNOWBALL
