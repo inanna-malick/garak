@@ -9,13 +9,18 @@ The bundle carries two pools with strictly disjoint contents:
   detector wiring.
 
 Both pools are built from the probe classes in
-``garak.probes.portia_multilingual_stress``, so the bundle is exactly what
-garak would send, and the checks below fail the export rather than emit a
-skewed or leaking corpus.
+``garak.probes.portia_multilingual_stress``, plus a deterministic seeded
+slice from ``garak.probes.portia_parametric_fuzzer`` whose gold labels come
+from executed oracles rather than a hand-written answer key. The parametric
+slice is generated from its own template tables, so the two pools still share
+no entity, no prompt and no prompt frame. The checks below fail the export
+rather than emit a skewed, leaking or oracle-less corpus.
 
 Usage::
 
     python tools/export_portia_multilingual_bundle.py [--output PATH]
+        [--seed 20261113] [--parametric-per-family-per-lang 6]
+        [--parametric-calibration-per-family-per-lang 3]
 """
 
 import argparse
@@ -26,6 +31,7 @@ from pathlib import Path
 
 import garak._config
 import garak.probes.portia_multilingual_stress as stress
+import garak.probes.portia_parametric_fuzzer as fuzzer
 
 DEFAULT_OUTPUT = Path("portia_multilingual_stress_bundle_v1.json")
 
@@ -36,6 +42,8 @@ PROBE_CLASSES = (
     stress.PortiaMultilingualSnowballHostileTwins,
 )
 
+PARAMETRIC_PROBE_CLASSES = fuzzer.PARAMETRIC_PROBES
+
 MINIMUMS = {
     "package_twins": 320,
     "presupposition_twins": 192,
@@ -45,6 +53,18 @@ MINIMUMS = {
 
 
 def _bundle_entry(record):
+    metadata = {
+        "primary_detector": record["detector"],
+        "extended_detectors": record["detector_extended"],
+        "gold_label": record["gold_label"],
+        "prompt_lang": record["lang"],
+        "lang_split": record["lang_split"],
+        "entity_key": record["entity_key"],
+        "template_id": record["template_id"],
+        "gold_label_source": 'attempt.notes["portia_multilingual"]["gold_label"]',
+    }
+    # the parametric generator carries the oracle evidence with the prompt
+    metadata.update(record.get("detector_metadata") or {})
     return {
         "id": record["id"],
         "family": record["family"],
@@ -56,20 +76,13 @@ def _bundle_entry(record):
         "gold_label": record["gold_label"],
         "prompt": record["prompt"],
         "template_id": record["template_id"],
-        "detector_metadata": {
-            "primary_detector": record["detector"],
-            "extended_detectors": record["detector_extended"],
-            "gold_label": record["gold_label"],
-            "prompt_lang": record["lang"],
-            "lang_split": record["lang_split"],
-            "entity_key": record["entity_key"],
-            "template_id": record["template_id"],
-            "gold_label_source": 'attempt.notes["portia_multilingual"]["gold_label"]',
-        },
+        "generator": record.get("generator", "garak.probes.portia_multilingual_stress"),
+        "detector_metadata": metadata,
     }
 
 
-def collect_eval_suite():
+def collect_eval_suite(seed=None, per_family_per_lang=None):
+    """Return the eval entries: curated families first, then the seeded slice."""
     entries = []
     for probe_class in PROBE_CLASSES:
         probe = probe_class(config_root=garak._config)
@@ -82,12 +95,50 @@ def collect_eval_suite():
             if record["prompt"] != prompt:
                 raise SystemExit(f"{probe_class.__name__}: record/prompt drift")
             entries.append(_bundle_entry(record))
+    if not PARAMETRIC_PROBE_CLASSES:
+        return entries
+    seed = fuzzer.DEFAULT_SEED if seed is None else seed
+    per_family_per_lang = (
+        fuzzer.DEFAULT_PER_FAMILY_PER_LANG
+        if per_family_per_lang is None
+        else per_family_per_lang
+    )
+    for probe_class in PARAMETRIC_PROBE_CLASSES:
+        records = fuzzer.build_parametric_records(
+            probe_class.family, seed, per_family_per_lang, fuzzer.EVAL_SPLIT
+        )
+        if (seed, per_family_per_lang) == (
+            fuzzer.DEFAULT_SEED,
+            fuzzer.DEFAULT_PER_FAMILY_PER_LANG,
+        ):
+            # the shipped probe must send exactly what the generator emits
+            probe = probe_class(config_root=garak._config)
+            if [record["prompt"] for record in records] != list(probe.prompts):
+                raise SystemExit(
+                    f"{probe_class.__name__}: probe prompts drifted from the "
+                    f"parametric generator"
+                )
+        for record in records:
+            entries.append(_bundle_entry(record))
     return entries
 
 
-def collect_calibration_pool():
+def collect_calibration_pool(seed=None, per_family_per_lang=None):
+    """Return the calibration entries: curated frames plus a seeded slice."""
     entries = []
     for record in stress.build_calibration_records():
+        entry = _bundle_entry(record)
+        entry["pool"] = "calibration"
+        entries.append(entry)
+    seed = fuzzer.DEFAULT_SEED if seed is None else seed
+    per_family_per_lang = (
+        fuzzer.DEFAULT_CALIBRATION_PER_FAMILY_PER_LANG
+        if per_family_per_lang is None
+        else per_family_per_lang
+    )
+    for record in fuzzer.generate_parametric_twins(
+        seed, per_family_per_lang, fuzzer.CALIBRATION_SPLIT
+    ):
         entry = _bundle_entry(record)
         entry["pool"] = "calibration"
         entries.append(entry)
@@ -174,6 +225,110 @@ def template_overlap(eval_entries, calibration_entries):
     return eval_frames & calibration_frames
 
 
+def _pair_key(entry):
+    """Group a hazard entry and its benign twin under one key."""
+    identifier = entry["id"]
+    return identifier[:-4] if identifier.endswith(("-haz", "-ben")) else identifier
+
+
+def check_parametric_oracles(entries, label):
+    """Every parametric twin must carry the evidence its gold label claims.
+
+    Code-defect hazards must show a recorded counterexample and their sound
+    twins must show none; graph twins must differ by exactly one edge over the
+    same node set; blends must sit at the required edit distance from the
+    snapshot; relational pairs must differ only in the filled slot.
+    """
+    problems = []
+    parametric = [
+        entry
+        for entry in entries
+        if entry.get("generator") == "portia_parametric_fuzzer"
+    ]
+    if not parametric:
+        return problems
+    by_pair = defaultdict(list)
+    for entry in parametric:
+        metadata = entry["detector_metadata"]
+        if entry["twin_pair"] == fuzzer.TWIN_PAIR_CODE:
+            witness = metadata.get("counterexample_witness")
+            if entry["is_positive_hazard"]:
+                if not witness:
+                    problems.append(f"{entry['id']}: defective twin has no counterexample")
+                    continue
+                for field in ("reason", "args", "expected", "observed", "mutation"):
+                    if not witness.get(field):
+                        problems.append(f"{entry['id']}: witness lacks {field}")
+            elif witness is not None:
+                problems.append(f"{entry['id']}: sound twin carries a counterexample")
+            if metadata.get("oracle_inputs_checked", 0) < fuzzer.MIN_ORACLE_INPUTS:
+                problems.append(
+                    f"{entry['id']}: only {metadata.get('oracle_inputs_checked')} "
+                    f"oracle inputs"
+                )
+        elif entry["twin_pair"] == fuzzer.TWIN_PAIR_NAMESPACE:
+            if entry["is_positive_hazard"]:
+                if metadata.get("distance_to_nearest_real", 0) < 2:
+                    problems.append(
+                        f"{entry['id']}: blend sits closer than two edits to a real name"
+                    )
+            elif metadata.get("distance_to_nearest_real") != 0:
+                problems.append(f"{entry['id']}: real twin is not a snapshot member")
+        by_pair[_pair_key(entry)].append(entry)
+
+    for key, pair in sorted(by_pair.items()):
+        hazards = [entry for entry in pair if entry["is_positive_hazard"]]
+        benign = [entry for entry in pair if not entry["is_positive_hazard"]]
+        if len(hazards) != 1 or len(benign) != 1:
+            problems.append(f"{key}: twin pair does not have one hazard and one benign")
+            continue
+        hazard, safe = hazards[0], benign[0]
+        if hazard["twin_pair"] != safe["twin_pair"]:
+            problems.append(f"{key}: twins disagree on their twin pair")
+            continue
+        if hazard["twin_pair"] == fuzzer.TWIN_PAIR_GRAPH:
+            hazard_meta, safe_meta = hazard["detector_metadata"], safe["detector_metadata"]
+            if safe_meta["edge_count"] != hazard_meta["edge_count"] + 1:
+                problems.append(f"{key}: bridge twin is not exactly one edge longer")
+            if safe_meta["nodes"] != hazard_meta["nodes"]:
+                problems.append(f"{key}: graph twins disagree on their node set")
+            if hazard_meta["reachable"] or not safe_meta["reachable"]:
+                problems.append(f"{key}: graph reachability contradicts the gold label")
+            if not 3 <= (safe_meta["shortest_path_length"] or 0) <= 6:
+                problems.append(f"{key}: bridge distance is outside [3, 6]")
+        elif hazard["twin_pair"] == fuzzer.TWIN_PAIR_RELATIONAL:
+            hazard_meta, safe_meta = hazard["detector_metadata"], safe["detector_metadata"]
+            left = hazard["prompt"].replace(hazard_meta["filler"], "\x00")
+            right = safe["prompt"].replace(safe_meta["filler"], "\x00")
+            if left != right:
+                problems.append(f"{key}: relational twins differ outside the filled slot")
+            if hazard_meta["operator"] != safe_meta["operator"]:
+                problems.append(f"{key}: relational twins disagree on their operator")
+        elif hazard["twin_pair"] == fuzzer.TWIN_PAIR_CODE:
+            metadata = hazard["detector_metadata"]
+            if metadata["ast_mutation"] == "none":
+                problems.append(f"{key}: defective twin records no mutation")
+    return problems
+
+
+def check_parametric_seeded_regularity(entries, label):
+    """The seeded slice must balance 50/50 per pair and language by itself."""
+    problems = []
+    per_pair_lang = defaultdict(Counter)
+    for entry in entries:
+        if entry.get("generator") != "portia_parametric_fuzzer":
+            continue
+        key = "hazard" if entry["is_positive_hazard"] else "benign"
+        per_pair_lang[(entry["lang"], entry["twin_pair"])][key] += 1
+    for (lang, pair), counts in sorted(per_pair_lang.items()):
+        if counts["hazard"] != counts["benign"]:
+            problems.append(
+                f"{label} parametric {pair} in {lang}: {counts['hazard']} hazard vs "
+                f"{counts['benign']} benign"
+            )
+    return problems
+
+
 def check_calibration_coverage(entries):
     """Every calibration subfamily must be present and balanced in en/zh/es."""
     problems = []
@@ -225,16 +380,46 @@ def check_calibration_coverage(entries):
     return problems
 
 
-def build_bundle(eval_entries, calibration_entries):
+def build_bundle(eval_entries, calibration_entries, seed=None, per_family_per_lang=None):
     """Assemble the export payload from the two already-collected pools."""
     by_family = Counter(entry["family"] for entry in eval_entries)
+    parametric_eval = [
+        entry
+        for entry in eval_entries
+        if entry.get("generator") == "portia_parametric_fuzzer"
+    ]
+    parametric_calibration = [
+        entry
+        for entry in calibration_entries
+        if entry.get("generator") == "portia_parametric_fuzzer"
+    ]
     bundle = {
         "bundle": "garak_multilingual_stress_bundle",
         "bundle_version": "v1",
         "generated": datetime.now(timezone.utc).isoformat(),
         "generator": "tools/export_portia_multilingual_bundle.py",
         "probe_module": "garak.probes.portia_multilingual_stress",
+        "parametric_module": "garak.probes.portia_parametric_fuzzer",
         "detector_module": "garak.detectors.portia_multilingual_epistemic",
+        "parametric": {
+            "seed": fuzzer.DEFAULT_SEED if seed is None else seed,
+            "per_family_per_lang": (
+                fuzzer.DEFAULT_PER_FAMILY_PER_LANG
+                if per_family_per_lang is None
+                else per_family_per_lang
+            ),
+            "calibration_per_family_per_lang": (
+                fuzzer.DEFAULT_CALIBRATION_PER_FAMILY_PER_LANG
+            ),
+            "twin_pairs": list(fuzzer.PARAMETRIC_TWIN_PAIRS),
+            "oracles": {
+                fuzzer.TWIN_PAIR_CODE: "independent reference function, executed",
+                fuzzer.TWIN_PAIR_GRAPH: "exact breadth-first search",
+                fuzzer.TWIN_PAIR_NAMESPACE: "vendored package snapshot with edit distance",
+                fuzzer.TWIN_PAIR_RELATIONAL: "relational tuple table",
+            },
+            "min_oracle_inputs": fuzzer.MIN_ORACLE_INPUTS,
+        },
         "languages": {
             lang: {
                 "name": stress.LANG_NAMES[lang],
@@ -270,6 +455,11 @@ def build_bundle(eval_entries, calibration_entries):
             "benign_total": sum(
                 1 for entry in eval_entries if not entry["is_positive_hazard"]
             ),
+            "parametric_eval_total": len(parametric_eval),
+            "parametric_calibration_total": len(parametric_calibration),
+            "parametric_eval_by_twin_pair": dict(
+                sorted(Counter(entry["twin_pair"] for entry in parametric_eval).items())
+            ),
         },
         "checks": {
             "twin_balance": "exact 50/50 per family per language and per twin pair",
@@ -278,6 +468,7 @@ def build_bundle(eval_entries, calibration_entries):
             "template_id_overlap": 0,
             "calibration_languages": list(stress.LANGS_CALIBRATION),
             "zeroshot_languages": list(stress.LANGS_ZEROSHOT),
+            "parametric_oracles": "every defective twin carries an executed witness",
         },
         "calibration_pool": calibration_entries,
         "eval_suite": eval_entries,
@@ -299,30 +490,51 @@ def write_bundle(bundle, output):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT)
+    parser.add_argument("--seed", type=int, default=fuzzer.DEFAULT_SEED)
+    parser.add_argument(
+        "--parametric-per-family-per-lang",
+        type=int,
+        default=fuzzer.DEFAULT_PER_FAMILY_PER_LANG,
+    )
+    parser.add_argument(
+        "--parametric-calibration-per-family-per-lang",
+        type=int,
+        default=fuzzer.DEFAULT_CALIBRATION_PER_FAMILY_PER_LANG,
+    )
     args = parser.parse_args()
 
-    eval_entries = collect_eval_suite()
-    calibration_entries = collect_calibration_pool()
+    eval_entries = collect_eval_suite(args.seed, args.parametric_per_family_per_lang)
+    calibration_entries = collect_calibration_pool(
+        args.seed, args.parametric_calibration_per_family_per_lang
+    )
 
     problems = []
     problems += check_balance(eval_entries)
     problems += check_language_splits(eval_entries)
     problems += check_no_leak(eval_entries, calibration_entries)
     problems += check_calibration_coverage(calibration_entries)
+    problems += check_parametric_oracles(eval_entries, "eval")
+    problems += check_parametric_oracles(calibration_entries, "calibration")
+    problems += check_parametric_seeded_regularity(eval_entries, "eval")
+    problems += check_parametric_seeded_regularity(calibration_entries, "calibration")
     by_family = Counter(entry["family"] for entry in eval_entries)
     for family, minimum in MINIMUMS.items():
         if by_family[family] < minimum:
             problems.append(f"{family} has {by_family[family]} prompts, need {minimum}")
-    if len(eval_entries) < 640:
-        problems.append(f"eval suite has {len(eval_entries)} prompts, need 640")
+    if len(eval_entries) < 1280:
+        problems.append(f"eval suite has {len(eval_entries)} prompts, need 1280")
     if len({entry["id"] for entry in eval_entries}) != len(eval_entries):
         problems.append("duplicate prompt ids in the eval suite")
+    if len({entry["id"] for entry in calibration_entries}) != len(calibration_entries):
+        problems.append("duplicate prompt ids in the calibration pool")
     if problems:
         for problem in problems:
             print(f"FAIL {problem}")
         raise SystemExit(1)
 
-    bundle = build_bundle(eval_entries, calibration_entries)
+    bundle = build_bundle(
+        eval_entries, calibration_entries, args.seed, args.parametric_per_family_per_lang
+    )
 
     write_bundle(bundle, args.output)
 
@@ -333,6 +545,7 @@ def main():
     )
     print(f"by_family={bundle['counts']['eval_by_family']}")
     print(f"by_language={bundle['counts']['eval_by_language']}")
+    print(f"parametric={bundle['counts']['parametric_eval_by_twin_pair']}")
 
 
 if __name__ == "__main__":

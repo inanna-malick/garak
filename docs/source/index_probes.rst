@@ -42,6 +42,7 @@ For a guide to writing probes, see :doc:`extending.probe`.
    probes/packagehallucination
    probes/phrasing
    probes/portia_multilingual_stress
+   probes/portia_parametric_fuzzer
    probes/promptinject
    probes/propile
    probes/realtoxicityprompts
