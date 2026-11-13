@@ -35,6 +35,7 @@ For detailed information on detector metrics and evaluation, see :doc:`../detect
    detectors/mitigation
    detectors/packagehallucination
    detectors/perspective
+   detectors/portia_multilingual_epistemic
    detectors/promptinject
    detectors/productkey
    detectors/propile
