@@ -27,9 +27,7 @@ from pathlib import Path
 import garak._config
 import garak.probes.portia_multilingual_stress as stress
 
-DEFAULT_OUTPUT = Path(
-    "/home/inanna/dev/argon-experiments/scratch/garak_multilingual_stress_bundle_v1.json"
-)
+DEFAULT_OUTPUT = Path("portia_multilingual_stress_bundle_v1.json")
 
 PROBE_CLASSES = (
     stress.PortiaMultilingualPackageTwins,
@@ -57,6 +55,7 @@ def _bundle_entry(record):
         "is_positive_hazard": record["is_positive_hazard"],
         "gold_label": record["gold_label"],
         "prompt": record["prompt"],
+        "template_id": record["template_id"],
         "detector_metadata": {
             "primary_detector": record["detector"],
             "extended_detectors": record["detector_extended"],
@@ -64,6 +63,7 @@ def _bundle_entry(record):
             "prompt_lang": record["lang"],
             "lang_split": record["lang_split"],
             "entity_key": record["entity_key"],
+            "template_id": record["template_id"],
             "gold_label_source": 'attempt.notes["portia_multilingual"]["gold_label"]',
         },
     }
@@ -153,34 +153,81 @@ def check_no_leak(eval_entries, calibration_entries):
     unexpected = calibration_langs - set(stress.LANGS_CALIBRATION)
     if unexpected:
         problems.append(f"calibration pool leaked into languages {sorted(unexpected)}")
+
+    shared_frames = template_overlap(eval_entries, calibration_entries)
+    if shared_frames:
+        problems.append(
+            f"prompt-frame overlap between pools: {len(shared_frames)} shared templates"
+        )
     return problems
 
 
-def main():
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT)
-    args = parser.parse_args()
+def template_overlap(eval_entries, calibration_entries):
+    """Return the prompt frames (by content digest) rendered in both pools.
 
-    eval_entries = collect_eval_suite()
-    calibration_entries = collect_calibration_pool()
+    Two pools that reuse the same template -- even with a different noun in the
+    slot -- collide here, which is what exact-prompt comparison alone misses."""
+    eval_frames = {stress.template_digest(entry["template_id"]) for entry in eval_entries}
+    calibration_frames = {
+        stress.template_digest(entry["template_id"]) for entry in calibration_entries
+    }
+    return eval_frames & calibration_frames
 
+
+def check_calibration_coverage(entries):
+    """Every calibration subfamily must be present and balanced in en/zh/es."""
     problems = []
-    problems += check_balance(eval_entries)
-    problems += check_language_splits(eval_entries)
-    problems += check_no_leak(eval_entries, calibration_entries)
-    by_family = Counter(entry["family"] for entry in eval_entries)
-    for family, minimum in MINIMUMS.items():
-        if by_family[family] < minimum:
-            problems.append(f"{family} has {by_family[family]} prompts, need {minimum}")
-    if len(eval_entries) < 640:
-        problems.append(f"eval suite has {len(eval_entries)} prompts, need 640")
-    if len({entry["id"] for entry in eval_entries}) != len(eval_entries):
-        problems.append("duplicate prompt ids in the eval suite")
-    if problems:
-        for problem in problems:
-            print(f"FAIL {problem}")
-        raise SystemExit(1)
+    per_lang_pair = defaultdict(Counter)
+    per_lang_subfamily = defaultdict(Counter)
+    for entry in entries:
+        key = "hazard" if entry["is_positive_hazard"] else "benign"
+        per_lang_pair[(entry["lang"], entry["twin_pair"])][key] += 1
+        per_lang_subfamily[(entry["lang"], entry["subfamily"])][key] += 1
+    for (lang, pair), counts in sorted(per_lang_pair.items()):
+        if pair == "continuation":
+            # neutral background prompts have no hazard twin by design
+            continue
+        if counts["hazard"] != counts["benign"]:
+            problems.append(
+                f"calibration pair {pair} in {lang}: {counts['hazard']} hazard vs "
+                f"{counts['benign']} benign"
+            )
+    per_lang_totals = defaultdict(Counter)
+    for (lang, subfamily), counts in per_lang_subfamily.items():
+        for key, value in counts.items():
+            per_lang_totals[subfamily][key] += value
+    required = {
+        "unreal_python",
+        "real_niche_python",
+        "false_presupposition",
+        "counterintuitive_true_presupposition",
+        "disconnected_graph_gold_no",
+        "connected_graph_gold_yes",
+        "vulnerable_or_buggy_snippet",
+        "patched_sound_snippet",
+        "benign_continuation",
+    }
+    missing = required - set(per_lang_totals)
+    if missing:
+        problems.append(f"calibration subfamilies absent: {sorted(missing)}")
+    for subfamily in sorted(required & set(per_lang_totals)):
+        langs = {
+            lang for (lang, name) in per_lang_subfamily if name == subfamily
+        }
+        if langs != set(stress.LANGS_CALIBRATION):
+            problems.append(
+                f"calibration {subfamily} languages {sorted(langs)} are not "
+                f"{list(stress.LANGS_CALIBRATION)}"
+            )
+        counts = {tuple(sorted(per_lang_subfamily[(lang, subfamily)].items())) for lang in langs}
+        if len(counts) > 1:
+            problems.append(f"calibration {subfamily} is unbalanced across languages")
+    return problems
 
+
+def build_bundle(eval_entries, calibration_entries):
+    """Assemble the export payload from the two already-collected pools."""
+    by_family = Counter(entry["family"] for entry in eval_entries)
     bundle = {
         "bundle": "garak_multilingual_stress_bundle",
         "bundle_version": "v1",
@@ -212,6 +259,11 @@ def main():
             "calibration_by_language": dict(
                 sorted(Counter(entry["lang"] for entry in calibration_entries).items())
             ),
+            "calibration_by_subfamily": dict(
+                sorted(
+                    Counter(entry["subfamily"] for entry in calibration_entries).items()
+                )
+            ),
             "hazard_total": sum(
                 1 for entry in eval_entries if entry["is_positive_hazard"]
             ),
@@ -223,6 +275,7 @@ def main():
             "twin_balance": "exact 50/50 per family per language and per twin pair",
             "entity_overlap": 0,
             "prompt_overlap": 0,
+            "template_id_overlap": 0,
             "calibration_languages": list(stress.LANGS_CALIBRATION),
             "zeroshot_languages": list(stress.LANGS_ZEROSHOT),
         },
@@ -230,10 +283,48 @@ def main():
         "eval_suite": eval_entries,
     }
 
-    args.output.parent.mkdir(parents=True, exist_ok=True)
-    with open(args.output, "w", encoding="utf-8") as handle:
+    return bundle
+
+
+def write_bundle(bundle, output):
+    """Write ``bundle`` to ``output`` as UTF-8 JSON and return the path."""
+    output = Path(output)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    with open(output, "w", encoding="utf-8") as handle:
         json.dump(bundle, handle, ensure_ascii=False, indent=1)
         handle.write("\n")
+    return output
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT)
+    args = parser.parse_args()
+
+    eval_entries = collect_eval_suite()
+    calibration_entries = collect_calibration_pool()
+
+    problems = []
+    problems += check_balance(eval_entries)
+    problems += check_language_splits(eval_entries)
+    problems += check_no_leak(eval_entries, calibration_entries)
+    problems += check_calibration_coverage(calibration_entries)
+    by_family = Counter(entry["family"] for entry in eval_entries)
+    for family, minimum in MINIMUMS.items():
+        if by_family[family] < minimum:
+            problems.append(f"{family} has {by_family[family]} prompts, need {minimum}")
+    if len(eval_entries) < 640:
+        problems.append(f"eval suite has {len(eval_entries)} prompts, need 640")
+    if len({entry["id"] for entry in eval_entries}) != len(eval_entries):
+        problems.append("duplicate prompt ids in the eval suite")
+    if problems:
+        for problem in problems:
+            print(f"FAIL {problem}")
+        raise SystemExit(1)
+
+    bundle = build_bundle(eval_entries, calibration_entries)
+
+    write_bundle(bundle, args.output)
 
     print(f"wrote {args.output}")
     print(
