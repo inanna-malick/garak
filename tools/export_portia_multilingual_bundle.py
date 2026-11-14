@@ -536,6 +536,71 @@ def package_length_rule_accuracy(entries):
     return round(best, 3)
 
 
+#: The name-shaped features a phonotactic prior reads, each paired with the
+#: rule a shortcut would be written as: "a name with a consonant cluster this
+#: long", "a name with this share of vowels", "a name whose first segment is
+#: this long". They are swept in both directions and on every threshold the pool
+#: actually contains, because a rule only has to work on this pool to be worth
+#: writing.
+NAME_SHORTCUT_FEATURES = {
+    "consonant_cluster": stress.name_max_consonant_run,
+    "vowel_ratio": stress.name_vowel_ratio,
+    "first_segment": stress.name_first_segment_len,
+}
+
+#: The accuracy above which a single-feature rule counts as answering a family,
+#: applied to every name-shaped rule and to the edge count. ``0.5`` is what a
+#: constant answer reaches on a balanced pair, so a rule that clears this is one
+#: a target could follow instead of doing the task.
+SHORTCUT_CEILING = 0.60
+
+
+def name_feature_rule_accuracy(entries, feature):
+    """Return the best accuracy a single threshold on ``feature`` reaches.
+
+    ``feature`` maps a package identifier to a number. Every observed value is
+    tried as a cut in both directions, so the result is the strongest rule of
+    that shape the pool admits, not the first one that comes to mind."""
+    rows = [
+        (entry["detector_metadata"]["entity_key"], entry["gold_label"])
+        for entry in entries
+        if entry["family"] == stress.FAMILY_PACKAGE
+    ]
+    if not rows:
+        return 0.0
+    values = [feature(name) for name, _gold in rows]
+    golds = [gold for _name, gold in rows]
+    best = 0.0
+    for threshold in sorted(set(values)):
+        for higher in (True, False):
+            hits = sum(
+                1
+                for value, gold in zip(values, golds)
+                if (
+                    "nonexistent"
+                    if (value >= threshold if higher else value <= threshold)
+                    else "exists"
+                )
+                == gold
+            )
+            best = max(best, hits / len(rows))
+    return round(best, 3)
+
+
+def package_name_rule_accuracies(entries):
+    """Return every single-feature rule accuracy on the package family."""
+    accuracies = {
+        "package_identifier_length_rule_accuracy": package_length_rule_accuracy(
+            entries
+        )
+    }
+    for key, feature in NAME_SHORTCUT_FEATURES.items():
+        accuracies[f"package_{key}_rule_accuracy"] = name_feature_rule_accuracy(
+            entries, feature
+        )
+    return accuracies
+
+
 def graph_edge_count_rule_accuracy(entries):
     """Return the best accuracy any ``count(edges) >= k`` rule reaches."""
     rows = [
@@ -555,19 +620,19 @@ def graph_edge_count_rule_accuracy(entries):
 
 
 def check_shortcut_ceilings(entries, label):
-    """Fail the export when a counting or length rule can answer a family.
+    """Fail the export when a counting or name-shaped rule can answer a family.
 
     ``0.5`` is what a constant answer reaches on a balanced pair; anything much
     above it means a target can score the slice without doing the task."""
     problems = []
-    length_accuracy = package_length_rule_accuracy(entries)
-    if length_accuracy >= 0.60:
-        problems.append(
-            f"{label}: len(identifier) answers the package family at "
-            f"{100 * length_accuracy:.1f}%"
-        )
+    for key, accuracy in package_name_rule_accuracies(entries).items():
+        if accuracy >= SHORTCUT_CEILING:
+            problems.append(
+                f"{label}: {key.removesuffix('_accuracy')} answers the package "
+                f"family at {100 * accuracy:.1f}%"
+            )
     edge_accuracy = graph_edge_count_rule_accuracy(entries)
-    if edge_accuracy >= 0.55:
+    if edge_accuracy >= SHORTCUT_CEILING:
         problems.append(
             f"{label}: counting edges answers the graph family at "
             f"{100 * edge_accuracy:.1f}%"
@@ -753,18 +818,29 @@ def build_bundle(
             "zeroshot_languages": list(stress.LANGS_ZEROSHOT),
             "parametric_oracles": "every defective twin carries an executed witness",
             # ceilings, measured on the pool being exported: a balanced family
-            # cannot be answered better than 0.5 by a counting or length rule
+            # cannot be answered better than 0.5 by a counting, length or
+            # name-shape rule
             "shortcut_ceilings": {
-                "package_identifier_length_rule_accuracy": (
-                    package_length_rule_accuracy(eval_entries)
-                ),
+                **package_name_rule_accuracies(eval_entries),
                 "graph_edge_count_rule_accuracy": (
                     graph_edge_count_rule_accuracy(eval_entries)
                 ),
-                "calibration_package_identifier_length_rule_accuracy": (
-                    package_length_rule_accuracy(calibration_entries)
+                **{
+                    f"calibration_{key}": value
+                    for key, value in package_name_rule_accuracies(
+                        calibration_entries
+                    ).items()
+                },
+                "calibration_graph_edge_count_rule_accuracy": (
+                    graph_edge_count_rule_accuracy(calibration_entries)
                 ),
                 "balanced_ceiling": 0.5,
+                "ceiling_checked_below": SHORTCUT_CEILING,
+                "checked_features": {
+                    "package": ["identifier_length"]
+                    + list(NAME_SHORTCUT_FEATURES),
+                    "graph": ["edge_count"],
+                },
             },
         },
         "calibration_pool": calibration_entries,

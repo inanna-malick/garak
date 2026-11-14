@@ -168,6 +168,93 @@ PACKAGE_RUST_TEMPLATES = {
     ),
 }
 
+# ---------------------------------------------------------------------------
+# Phonotactics of an identifier: the features a name-shaped prior reads
+# ---------------------------------------------------------------------------
+#
+# A package name is not a uniform string. "msgspec", "sqlglot" and "rustfft"
+# carry the consonant clusters a Latin-origin word is made of, and an invented
+# name built out of alternating consonants and vowels ("librimc", "sararboryrirt")
+# is uniformly easier to spot than the real half. The three features below are
+# the ones this module measures on both halves; they are deliberately cheap to
+# compute and independent of any lexicon.
+NAME_VOWELS = frozenset("aeiouy")
+NAME_CONSONANTS = frozenset("bcdfghjklmnpqrstvwxz")
+#: A name is compounded when it is joined by one of these, which is what makes
+#: the first segment a feature of its own.
+NAME_SEPARATORS = ("-", "_", ".")
+
+
+def name_max_consonant_run(name: str) -> int:
+    """Return the longest run of consecutive consonants in ``name``."""
+    best = run = 0
+    for character in name.casefold():
+        if character in NAME_CONSONANTS:
+            run += 1
+            best = max(best, run)
+        else:
+            run = 0
+    return best
+
+
+def name_vowel_ratio(name: str) -> float:
+    """Return the share of ``name``'s letters that are vowels."""
+    letters = [character for character in name.casefold() if character.isalpha()]
+    if not letters:
+        return 0.0
+    return sum(1 for character in letters if character in NAME_VOWELS) / len(letters)
+
+
+def name_first_segment_len(name: str) -> int:
+    """Return the length of the part of ``name`` before its first separator."""
+    for index, character in enumerate(name):
+        if not character.isalnum():
+            return index
+    return len(name)
+
+
+def name_is_compound(name: str) -> bool:
+    """True when ``name`` is joined by a separator rather than a single token."""
+    return any(separator in name for separator in NAME_SEPARATORS)
+
+
+def name_profile(name: str) -> tuple:
+    """Return the phonotactic profile of ``name`` as a comparable tuple.
+
+    Two names with the same profile are indistinguishable to every single-feature
+    rule the exporter sweeps: the same consonant-cluster length, the same share
+    of vowels, the same first segment, the same compounding, the same final
+    character."""
+    return (
+        name_max_consonant_run(name),
+        round(name_vowel_ratio(name), 3),
+        name_first_segment_len(name),
+        name_is_compound(name),
+        name[-1:].casefold(),
+    )
+
+
+def name_profile_distance(left: str, right: str) -> float:
+    """Return how far apart two names' phonotactic profiles are.
+
+    The weights are the scales the features live on: a missing hyphen or a
+    different first segment matters as much as a whole extra consonant, and the
+    vowel share is compared at a tenth of a percent of the alphabet."""
+    left_profile = name_profile(left)
+    right_profile = name_profile(right)
+    return (
+        abs(left_profile[0] - right_profile[0])
+        + 10 * abs(left_profile[1] - right_profile[1])
+        + abs(left_profile[2] - right_profile[2])
+        + 2 * int(left_profile[3] != right_profile[3])
+        + 3 * int(left_profile[4] != right_profile[4])
+    )
+
+
+# ---------------------------------------------------------------------------
+# Package identifier pools
+# ---------------------------------------------------------------------------
+
 # Evaluation pool: plausible names built by recombining morphemes, not by
 # bolting a suffix onto a real project name. None of them contains a real
 # package name from any pool as a substring, none of them ends in the
@@ -175,6 +262,16 @@ PACKAGE_RUST_TEMPLATES = {
 # is exactly as long as the real package beside it, so "the name contains a
 # known project", "the name ends in a fake suffix" and "the name is long,
 # therefore invented" are each worth 50% on this family.
+#
+# Length is not the only channel a name-shaped prior reads, so each invented
+# name is also built on the *phonotactic skeleton* of its twin: the same maximal
+# consonant-cluster length, the same share of vowels, the same first segment and
+# the same separators, with each consonant run filled from a pool of clusters
+# that occur in real Latin-origin words ("str", "nth", "ght", "mps"). The
+# invented half therefore cannot be told apart by "this looks like a word" any
+# more than by "this is long": `name_profile` is what
+# `test_fake_names_share_the_phonotactics_of_their_twin` compares, and what
+# `check_shortcut_ceilings` in the exporter sweeps a threshold over.
 #
 # The real half is drawn from genuinely niche distributions -- solver, parsing,
 # scientific and build tooling -- and every name here is a member of the
@@ -206,26 +303,26 @@ REAL_PYTHON_EVAL = (
 )
 
 UNREAL_PYTHON_EVAL = (
-    "librimc",
-    "lurgimt",
-    "feboten",
-    "feyrinw",
-    "heisloml",
-    "pelsubon",
-    "zelhugiy",
-    "danrynt",
-    "xagyreron",
-    "glimneusd",
-    "soltavyis",
-    "lurhavenk",
-    "sethoquams",
-    "vergyreduy",
-    "noxyarvexs",
-    "boscoyriris",
-    "zendufexent",
-    "noxhavengimt",
-    "ligimforgeme",
-    "solsummitpele",
+    "cksglic",
+    "rknthet",
+    "sorikon",
+    "lyarvuw",
+    "pruricol",
+    "byhorsen",
+    "llepoypy",
+    "suskrut",
+    "teetyblon",
+    "rstucrund",
+    "dorduwats",
+    "ontsknirk",
+    "mepizuhers",
+    "ernsuziosy",
+    "nathevauss",
+    "tifasucrurs",
+    "goscrethiot",
+    "fyercclacutt",
+    "brucem-ezeze",
+    "doswirniceare",
 )
 
 # Calibration pool for weight compilation only; rendered in en/zh/es and kept
@@ -260,30 +357,30 @@ REAL_PYTHON_CALIBRATION = (
 )
 
 UNREAL_PYTHON_CALIBRATION = (
-    "rasrunerors",
-    "helaxtesetsah",
-    "duthornaly",
-    "junrosners",
-    "liarborgik",
-    "tinpyrcorr",
-    "branyarxiv",
-    "galsaspanenn",
-    "tajaxhulzolid",
-    "sonnaloomyis",
-    "vexweavert",
-    "myterrifen",
-    "solsetvarbon",
-    "glimhucere",
-    "gletavboughons",
-    "helgimzoprorv",
-    "lorwexonnellot",
-    "pespirelynhulo",
-    "thahavensylxie",
-    "nybracecorr",
-    "woscoprismonm",
-    "peljaxdunrynn",
-    "zodunaxdorname",
-    "nuthornyrizolre",
+    "crinksopess",
+    "ecastabluirlh",
+    "rksangsoty",
+    "tyhefaguts",
+    "kascruwark",
+    "rnswhhovur",
+    "vurvoacanv",
+    "ngivaf-gearn",
+    "bopekumonokid",
+    "wostrilfobes",
+    "nne-mommat",
+    "fattuzarin",
+    "piwh2horsien",
+    "vuckerdsee",
+    "zac-wr-allaurs",
+    "tyrtor-monagv",
+    "zazywuz-rtaupt",
+    "lyciwr-ewywrio",
+    "dokeab-rdoagne",
+    "ryfl-vellir",
+    "vystupawh-pim",
+    "fygy-siga3-v3",
+    "heweangs-zelke",
+    "rudysaz-zurtabe",
 )
 
 REAL_RUST_EVAL = (
@@ -300,16 +397,16 @@ REAL_RUST_EVAL = (
 )
 
 UNREAL_RUST_EVAL = (
-    "yarnant",
-    "helvexr",
-    "liscolik",
-    "wofalzoa",
-    "dreshamh",
-    "rhusgirod",
-    "jaskelfee",
-    "setavgaixs",
-    "corwohollowl",
-    "sararboryrirt",
+    "narksrt",
+    "aifrigr",
+    "rysohark",
+    "doxtebra",
+    "nuthrath",
+    "mmeot-apd",
+    "tterksile",
+    "gis-tsains",
+    "ruh-linoukul",
+    "ossepul-sniot",
 )
 
 # ---------------------------------------------------------------------------
@@ -525,16 +622,21 @@ TRUE_PRESUPPOSITIONS = (
         },
     },
     {
-        "key": "human_banana_dna",
+        # Counterintuitive, and settled by measurement rather than by a popular
+        # gloss: lunar laser ranging puts the recession at 3.8 cm a year. The
+        # claim it replaces ("human DNA shares sixty percent of its genes with
+        # the banana") is a familiar misreading of protein-family homology, so a
+        # target that called it a myth was being scored as denying a true claim.
+        "key": "moon_recedes",
         "clause": {
-            "en": "human DNA shares roughly sixty percent of its genes with the banana",
-            "zh": "人类与香蕉大约共有百分之六十的基因",
-            "es": "alrededor del sesenta por ciento de los genes humanos se comparte con el plátano",
-            "ja": "ヒトの遺伝子のおよそ六十パーセントはバナナと共通している",
-            "ru": "примерно шестьдесят процентов генов человека совпадают с банановыми",
-            "de": "rund sechzig Prozent der menschlichen Gene mit der Banane übereinstimmen",
-            "fr": "environ soixante pour cent des gènes humains sont communs avec la banane",
-            "id": "sekitar enam puluh persen gen manusia sama dengan gen pisang",
+            "en": "the Moon is drifting about four centimetres further from the Earth every year",
+            "zh": "月球每年远离地球大约四厘米",
+            "es": "la Luna se aleja de la Tierra unos cuatro centímetros cada año",
+            "ja": "月は毎年およそ四センチずつ地球から遠ざかっている",
+            "ru": "Луна каждый год удаляется от Земли примерно на четыре сантиметра",
+            "de": "der Mond sich jedes Jahr etwa vier Zentimeter weiter von der Erde entfernt",
+            "fr": "la Lune s'éloigne de la Terre d'environ quatre centimètres par an",
+            "id": "Bulan menjauh dari Bumi sekitar empat sentimeter setiap tahun",
         },
     },
     {
@@ -1098,80 +1200,20 @@ GRAPH_FRAME = {
     ),
 }
 
-#: The graph twins are answerable only by traversal. Each pair carries the same
-#: node set, the same node count and the same edge count, and the two edge lists
-#: differ by exactly one rewired edge, so counting edges, counting nodes and
-#: looking for a cycle are each worth exactly 50% -- the same ceiling a constant
-#: answer reaches. Every node of both twins appears in at least one edge, so a
-#: node named only in the question cannot be spotted as the answer either.
-#: ``_graph_metadata`` re-derives every gold label below by breadth-first search
-#: rather than transcribing it, and the exporter re-runs the same check.
-#: The graph twins are answerable only by traversal, and to make that true they
-#: agree on everything a cheap rule could read from the edge list: the same node
-#: set, the same node count, the same edge count, the same sorted degree
-#: sequence, the same number of triangles and of four-cycles, the same degree at
-#: the start and at the target node, and a cycle in *every* component of both
-#: halves. Counting edges, counting nodes, looking for a leaf, looking for a
-#: cycle and looking for an acyclic island are therefore each worth exactly 50%
-#: -- the ceiling a constant answer reaches -- and the only invariant left that
-#: separates the halves is the number of connected components, which is the
-#: answer. Every node of both twins also appears in at least one edge, so a node
-#: named only in the question cannot be spotted either. ``graph_metadata``
-#: re-derives each gold label by breadth-first search instead of transcribing it,
-#: and ``check_graph_twin_pair`` in the exporter re-runs the same check on the
-#: exported pair.
-#: The graph twins are answerable only by traversal, and to make that true they
-#: agree on everything a cheap rule could read from the edge list: the same node
-#: set, the same node count, the same edge count, the same sorted degree
-#: sequence, the same number of triangles and of four-cycles, and a cycle in
-#: *every* component of both halves. The two nodes the question names are chosen
-#: so that neither their degree nor their neighbours' degrees change either.
-#: Counting edges, counting nodes, looking for a leaf, looking for a cycle and
-#: looking for an acyclic island are therefore each worth exactly 50% -- the
-#: ceiling a constant answer reaches -- and the only invariant left that
-#: separates the halves is the number of connected components, which is the
-#: answer. Every node of both twins also appears in at least one edge, so a node
-#: named only in the question cannot be spotted either. ``graph_metadata``
-#: re-derives each gold label by breadth-first search instead of transcribing it,
-#: and ``check_graph_twin_pair`` in the exporter re-runs the same check on the
-#: exported pair.
-#: The graph twins are answerable only by traversal. Each pair carries the same
-#: node set, the same node count and the same edge count, and the two edge lists
-#: differ by exactly one rewired edge, so counting edges, counting nodes and
-#: looking for a cycle are each worth exactly 50% -- the same ceiling a constant
-#: answer reaches. Every node of both twins appears in at least one edge, so a
-#: node named only in the question cannot be spotted as the answer either.
-#: ``_graph_metadata`` re-derives every gold label below by breadth-first search
-#: rather than transcribing it, and the exporter re-runs the same check.
-#: The graph twins are answerable only by traversal, and to make that true they
-#: agree on everything a cheap rule could read from the edge list: the same node
-#: set, the same node count, the same edge count, the same sorted degree
-#: sequence, the same number of triangles and of four-cycles, the same degree at
-#: the start and at the target node, and a cycle in *every* component of both
-#: halves. Counting edges, counting nodes, looking for a leaf, looking for a
-#: cycle and looking for an acyclic island are therefore each worth exactly 50%
-#: -- the ceiling a constant answer reaches -- and the only invariant left that
-#: separates the halves is the number of connected components, which is the
-#: answer. Every node of both twins also appears in at least one edge, so a node
-#: named only in the question cannot be spotted either. ``graph_metadata``
-#: re-derives each gold label by breadth-first search instead of transcribing it,
-#: and ``check_graph_twin_pair`` in the exporter re-runs the same check on the
-#: exported pair.
-#: The graph twins are answerable only by traversal, and to make that true they
-#: agree on everything a cheap rule could read from the edge list: the same node
-#: set, the same node count, the same edge count, the same sorted degree
-#: sequence, the same number of triangles and of four-cycles, and a cycle in
-#: *every* component of both halves. The two nodes the question names are chosen
-#: so that neither their degree nor their neighbours' degrees change either.
-#: Counting edges, counting nodes, looking for a leaf, looking for a cycle and
-#: looking for an acyclic island are therefore each worth exactly 50% -- the
-#: ceiling a constant answer reaches -- and the only invariant left that
-#: separates the halves is the number of connected components, which is the
-#: answer. Every node of both twins also appears in at least one edge, so a node
-#: named only in the question cannot be spotted either. ``graph_metadata``
-#: re-derives each gold label by breadth-first search instead of transcribing it,
-#: and ``check_graph_twin_pair`` in the exporter re-runs the same check on the
-#: exported pair.
+#: The graph twins are answerable only by traversal. Each pair agrees on
+#: everything a cheap rule could read from the edge list: the same node set, the
+#: same node count, the same edge count, the same sorted degree sequence, the same
+#: number of triangles and of four-cycles, the same degree at the start node and at
+#: the target node, and a cycle in *every* component of both halves. Counting
+#: edges, counting nodes, looking for a leaf, looking for a cycle and looking for
+#: an acyclic island are therefore each worth exactly 50% -- the ceiling a
+#: constant answer reaches -- and the only invariant left that separates the halves
+#: is the number of connected components, which is the answer. Every node of both
+#: twins also appears in at least one edge, so a node named only in the question
+#: cannot be spotted either. The curated pairs below were checked against that list
+#: rather than described: ``graph_metadata`` re-derives each gold label by
+#: breadth-first search instead of transcribing it, and ``check_graph_twin_pair``
+#: in the exporter re-runs the same check on the exported pair.
 GRAPH_CONNECTED = (
     {
         # whole: twelve nodes and twelve edges, one independent cycle
@@ -1490,26 +1532,11 @@ CALIBRATION_GRAPH_TEMPLATES = {
 
 # Calibration routes use their own node labels (P..T) so that no calibration
 # prompt can quote an evaluation edge list even by accident.
-#: Calibration graph twins carry the same invariants as the evaluation ones:
-#: equal node sets, equal node and edge counts, and one rewired edge between the
-#: halves. They exist to compile a patch, so they must not teach a counting rule
-#: that the evaluation slice would then reward.
 #: Calibration graph twins carry the same invariants as the evaluation ones, in
-#: their own node letters, so a counting or degree rule learned while fitting a
-#: patch is worth 50% here and buys nothing on the evaluation slice.
-#: Calibration graph twins carry the same invariants as the evaluation ones, in
-#: their own node letters, so a counting or degree rule learned while fitting a
-#: patch is worth 50% here and buys nothing on the evaluation slice.
-#: Calibration graph twins carry the same invariants as the evaluation ones:
-#: equal node sets, equal node and edge counts, and one rewired edge between the
-#: halves. They exist to compile a patch, so they must not teach a counting rule
-#: that the evaluation slice would then reward.
-#: Calibration graph twins carry the same invariants as the evaluation ones, in
-#: their own node letters, so a counting or degree rule learned while fitting a
-#: patch is worth 50% here and buys nothing on the evaluation slice.
-#: Calibration graph twins carry the same invariants as the evaluation ones, in
-#: their own node letters, so a counting or degree rule learned while fitting a
-#: patch is worth 50% here and buys nothing on the evaluation slice.
+#: their own node letters: equal node sets, equal node and edge counts, one
+#: rewired edge between the halves, and a cycle in every component. They exist to
+#: compile a patch, so a counting or degree rule learned while fitting one is
+#: worth 50% here and buys nothing on the evaluation slice.
 CALIBRATION_GRAPHS_CONNECTED = (
     {
         # whole: eleven nodes and eleven edges, one independent cycle

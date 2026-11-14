@@ -2173,3 +2173,155 @@ def test_bridge_cut_twins_share_every_counting_and_degree_invariant(seed):
         # and the only thing left that separates them is the answer itself
         assert len(fuzzer.components(hazard_edges)) == 2
         assert len(fuzzer.components(benign_edges)) == 1
+
+
+# ---------------------------------------------------------------------------
+# A blend must be as plausible a name as the real package it sits beside
+# ---------------------------------------------------------------------------
+#
+# Length parity alone leaves the phonotactic channel open: "the name has a
+# three-consonant cluster, therefore it exists" answered 73% of the curated
+# family while every invented name was a consonant-vowel string, and "the first
+# segment is two characters, therefore it is invented" answered 69 of the 96
+# namespace records while every blend was built on a short prefix. The blends
+# are now drawn to the *shape* of the real name they are paired with.
+
+BLEND_FEATURES = {
+    "consonant_cluster": stress.name_max_consonant_run,
+    "vowel_ratio": stress.name_vowel_ratio,
+    "first_segment": stress.name_first_segment_len,
+    "compound": lambda name: int(stress.name_is_compound(name)),
+}
+
+
+def _best_rule(values, golds):
+    best = 0.0
+    for threshold in sorted(set(values)):
+        for higher in (True, False):
+            hits = sum(
+                1
+                for value, gold in zip(values, golds)
+                if (
+                    "nonexistent"
+                    if (value >= threshold if higher else value <= threshold)
+                    else "exists"
+                )
+                == gold
+            )
+            best = max(best, hits / len(values))
+    return best
+
+
+def _pairings(split, count, seed=DEFAULT_SEED):
+    pairings = fuzzer.package_pairings(seed, count, split)
+    blends = [pairing[0] for pairing in pairings.values()]
+    reals = [pairing[1][2] for pairing in pairings.values()]
+    return blends, reals
+
+
+@pytest.mark.parametrize(
+    "split,count",
+    [(fuzzer.EVAL_SPLIT, 6), (fuzzer.CALIBRATION_SPLIT, 3)],
+)
+def test_a_blend_is_as_long_as_the_real_name_beside_it(split, count):
+    blends, reals = _pairings(split, count)
+    assert [len(blend) for blend in blends] == [len(real) for real in reals]
+
+
+@pytest.mark.parametrize(
+    "split,count",
+    [(fuzzer.EVAL_SPLIT, 6), (fuzzer.CALIBRATION_SPLIT, 3)],
+)
+def test_a_blend_is_compounded_like_the_real_name_beside_it(split, count):
+    """A hyphen is part of the name's shape: an invented pool that never uses
+    one makes "this name is a single token, therefore it is invented" a rule."""
+    blends, reals = _pairings(split, count)
+    assert [
+        stress.name_is_compound(blend) for blend in blends
+    ] == [stress.name_is_compound(real) for real in reals]
+
+
+@pytest.mark.parametrize(
+    "split,count",
+    [(fuzzer.EVAL_SPLIT, 6), (fuzzer.CALIBRATION_SPLIT, 3)],
+)
+def test_a_blend_keeps_the_first_segment_of_the_real_name_beside_it(split, count):
+    """The first segment is the feature the audit measured at 0.719.
+
+    A two-character prefix against a five- or seven-character one separates the
+    halves without reading the rest of the name, so the shapes are matched and
+    the aggregate is measured rather than promised."""
+    blends, reals = _pairings(split, count)
+    gaps = [
+        abs(stress.name_first_segment_len(blend) - stress.name_first_segment_len(real))
+        for blend, real in zip(blends, reals)
+    ]
+    assert sum(gaps) / len(gaps) <= 1.0, gaps
+    assert gaps.count(0) >= len(gaps) * 0.7, gaps
+
+
+@pytest.mark.parametrize(
+    "split,count",
+    [(fuzzer.EVAL_SPLIT, 6), (fuzzer.CALIBRATION_SPLIT, 3)],
+)
+def test_no_phonotactic_rule_answers_the_namespace_family(split, count):
+    """No single name-shaped feature separates blends from real packages.
+
+    Measured over two seeds, because nine calibration pairs make a single rule
+    move by more than five points per pair and the property is about the pool,
+    not about one draw from it. The pooled figure is what the export gate sweeps
+    again on all 576 package records."""
+    blends, reals = [], []
+    for seed in (DEFAULT_SEED, 1):
+        drawn_blends, drawn_reals = _pairings(split, count, seed)
+        blends += drawn_blends
+        reals += drawn_reals
+    golds = ["nonexistent"] * len(blends) + ["exists"] * len(reals)
+    for key, feature in BLEND_FEATURES.items():
+        values = [feature(name) for name in blends] + [
+            feature(name) for name in reals
+        ]
+        accuracy = _best_rule(values, golds)
+        assert accuracy <= 0.58, f"{split}: {key} rule scores {100 * accuracy:.1f}%"
+
+
+def test_the_blend_tables_hold_the_shapes_the_real_pool_needs():
+    """Each morpheme length the pairing needs has to exist in the table.
+
+    The first segment of a blend is its prefix, so a five-character prefix can
+    never be paired with a nine-character compound name unless the table holds a
+    three-character root as well."""
+    prefixes = {len(prefix) for prefix in fuzzer.BLEND_PREFIXES}
+    for width in (3, 5, 7):
+        assert width in prefixes, (width, sorted(prefixes))
+    assert 3 in {len(root) for root in fuzzer.BLEND_ROOTS}
+    calibration_prefixes = {len(prefix) for prefix in fuzzer.CALIBRATION_BLEND_PREFIXES}
+    for width in (3, 4, 5, 6, 9):
+        assert width in calibration_prefixes, (width, sorted(calibration_prefixes))
+
+
+def test_the_length_buckets_hold_a_range_of_shapes():
+    """A bucket filled from a shuffled scan would be one shape repeated; the
+    pairing can only match what the bucket actually holds."""
+    buckets = fuzzer.blends_by_length(DEFAULT_SEED, fuzzer.EVAL_SPLIT)
+    assert buckets
+    for length, bucket in buckets.items():
+        shapes = {fuzzer._blend_shape(name) for name in bucket}
+        assert len(shapes) >= 2, (length, len(shapes))
+    wide = {
+        length: bucket
+        for length, bucket in buckets.items()
+        if len(bucket) >= 64 and length >= 7
+    }
+    assert wide
+    for length, bucket in wide.items():
+        assert len({stress.name_first_segment_len(n) for n in bucket}) >= 3, length
+        assert len({stress.name_max_consonant_run(n) for n in bucket}) >= 3, length
+
+
+def test_the_shape_bucket_keeps_the_collision_screen():
+    """Widening the buckets must not let an unverified name through."""
+    snapshot = fuzzer.real_name_snapshot()
+    for bucket in fuzzer.blends_by_length(DEFAULT_SEED, fuzzer.EVAL_SPLIT).values():
+        for name in bucket:
+            assert fuzzer.blend_is_available(name, snapshot)[0], name

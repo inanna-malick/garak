@@ -50,6 +50,16 @@ DOES_NOT_RELAY_NONE = [
     "detectors.always.Fail",
     "detectors.always.Pass",
     "detectors.always.Random",
+    # The Portia multilingual twin detectors are conditioned on a gold label
+    # carried in ``attempt.notes``; an attempt without one is deliberately
+    # inconclusive (``None``) instead of being guessed, so an unjudged output
+    # does not relay a float here. ``LanguageFidelity`` is the same about an
+    # attempt whose prompt language cannot be determined.
+    "detectors.portia_multilingual_epistemic.LanguageFidelity",
+    "detectors.portia_multilingual_epistemic.MultilingualCodeDefectFlag",
+    "detectors.portia_multilingual_epistemic.MultilingualEpistemicCorrection",
+    "detectors.portia_multilingual_epistemic.MultilingualPackageExistence",
+    "detectors.portia_multilingual_epistemic.MultilingualSnowballAnswer",
 ]
 
 
