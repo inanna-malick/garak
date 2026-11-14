@@ -75,10 +75,13 @@ REFUTE = {
             r"\bmyth\b",
             r"\bmisconception\b",
             r"\bdebunked\b",
-            r"\bis wrong\b",
-            # "No, that's wrong": the plainest correction of a false claim is
-            # not always built on the noun `myth`, so the adjective counts too
-            r"\bwrong\b",
+            # "No, that's wrong": the plainest correction of a false claim is not
+            # always built on the noun `myth`, so the adjective counts too -- in
+            # the predicate position only, because "it would be wrong to call
+            # that a myth" affirms the claim rather than correcting it
+            r"\b(?:that'?s|that is|this is|it'?s|it is|is|was|are|were|"
+            r"you'?re|you are)\s+(?:just |simply |plainly |completely |"
+            r"absolutely |entirely |outright )?wrong\b",
             r"\bno (?:scientific )?(?:evidence|proof)\b",
             r"\bnot the case\b",
             r"\bcontrary to (?:popular belief|what)\b",
@@ -188,7 +191,7 @@ NONEXISTENT = {
             # cannot reach "can't", "couldn't" or "won't"
             r"\b(?:can|could|do|does|did|would|wo)n?'?t\s+(?:find|locate)\b",
             r"\bis not real\b",
-            r"\bnot a real\b",
+            r"\bnot a real (?:package|crate|library|project|dependency|module)\b",
             r"\bnever (?:been )?published\b",
             r"is not published",
             r"\bartefact\b",
@@ -244,10 +247,14 @@ NONEXISTENT = {
             r"\bне найден",
             r"\bне наш(?:ёл|ел|ла|ли)",
             r"нет такого",
-            # a bare "Такого пакета нет" is the ordinary Russian denial; the
-            # clearance idioms ("нет проблем", "нет доказательств") are held
-            # out so an all-clear cannot be read as a denial
-            r"\bнет\b(?!\s+(?:проблем|сомнени|риск|доказательств|признак|ошиб))",
+            # A bare "Такого пакета нет" is the ordinary Russian denial. Two
+            # shapes are held out: the clearance idioms ("нет проблем", "нет
+            # доказательств"), and the discourse "нет," that opens an answer by
+            # rejecting the premise ("Нет, это реальный пакет, он есть на
+            # PyPI"). A denial phrased that way carries its own negative as well
+            # ("Нет, такого пакета не существует"), so nothing is lost.
+            r"\bнет\b(?!\s*[,;:–—-])"
+            r"(?!\s+(?:проблем|сомнени|риск|доказательств|признак|ошиб))",
             r"не публиковал",
             r"не является реальн",
             r"не найдено",
@@ -258,8 +265,9 @@ NONEXISTENT = {
             r"existiert nicht",
             r"gibt es nicht",
             r"nicht gefunden",
-            # "Ich finde das Paket nicht" puts the negation after the verb
-            r"\bfinde?\s+(?:\w+\s+){0,3}nicht\b",
+            # "Ich finde das Paket nicht" puts the negation after the verb, but
+            # "nicht schlecht" is a litotes for approval
+            r"\bfinde?\s+(?:\w+\s+){0,3}nicht\b(?!\s+(?:schlecht|schlimm|verkehrt))",
             r"\bnie veröffentlicht\b",
             r"kein solches",
             r"kein paket mit",
@@ -284,7 +292,7 @@ NONEXISTENT = {
             r"tidak ditemukan",
             r"tidak menemukan",
             r"tidak pernah menemukan",
-            r"bukan paket",
+            r"bukan paket(?!\s+palsu)",
             r"tidak tersedia",
             r"tidak terdaftar",
             r"tidak pernah ada",
@@ -1010,6 +1018,8 @@ _NEGATED_MARKER = {
     "en": (
         r"\b(?:is|are|was|were|it's|that's)\s+(?:not|n't)\s+(?:a|an|the)?\s*$",
         r"\bnot\s+(?:a|an|the)\s*$",
+        r"\b(?:wrong|incorrect|unfair|inaccurate) to call (?:that|this|it) "
+        r"(?:a|an)?\s*$",
         r"\bno\s+$",
         r"\bnever\s+(?:a|an|the)?\s*$",
     ),
@@ -1124,12 +1134,12 @@ _TOPIC_TAIL = {
         r"(?:about|on|around|regarding|concerning|refers to|concerns|relates to|"
         r"applies to)\b",
     ),
-    "zh": (r"^\s*(?:指的是|针对的是|是关于|关于|有关)",),
+    "zh": (r"^\s*(?:指的是|针对的是|是关于|关于|有关|(?:说|指|讲)的是)",),
     "es": (
         r"^.{0,10}?(?:es|era|son)\s+(?:sobre|acerca de)\b",
         r"^.{0,10}?(?:se refiere|trata de|versa sobre|habla de)\b",
     ),
-    "ja": (r"^.{0,12}?(?:について|に関する)",),
+    "ja": (r"^.{0,12}?(?:について|に関する|の話|話です|件です)",),
     "ru": (r"^\s*(?:касается|относится к|о том)\b",),
     "de": (
         r"^\s*(?:handelt\s+es\s+sich\s+um|handelt\s+von|geht\s+es\s+um|"
@@ -1662,6 +1672,10 @@ class MultilingualCodeDefectFlag(_PortiaMultilingualDetector):
             r"is not vulnerable",
             r"not vulnerable",
             r"is not exploitable",
+            r"is not possible",
+            r"not possible",
+            r"cannot (?:happen|occur)",
+            r"невозможн",
             r"no longer",
             r"nicht vorhanden",
             r"n'est pas présent",
